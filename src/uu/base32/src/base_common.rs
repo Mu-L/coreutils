@@ -34,12 +34,15 @@ pub mod options {
 }
 
 impl Config {
-    fn from(options: clap::ArgMatches) -> Result<Config, String> {
+    pub fn from(app_name: &str, options: &clap::ArgMatches) -> Result<Config, String> {
         let file: Option<String> = match options.values_of(options::FILE) {
             Some(mut values) => {
                 let name = values.next().unwrap();
-                if values.len() != 0 {
-                    return Err(format!("extra operand ‘{}’", name));
+                if let Some(extra_op) = values.next() {
+                    return Err(format!(
+                        "extra operand '{}'\nTry '{} --help' for more information.",
+                        extra_op, app_name
+                    ));
                 }
 
                 if name == "-" {
@@ -58,7 +61,7 @@ impl Config {
             .value_of(options::WRAP)
             .map(|num| {
                 num.parse::<usize>()
-                    .map_err(|e| format!("Invalid wrap size: ‘{}’: {}", num, e))
+                    .map_err(|_| format!("invalid wrap size: '{}'", num))
             })
             .transpose()?;
 
@@ -78,10 +81,17 @@ pub fn parse_base_cmd_args(
     about: &str,
     usage: &str,
 ) -> Result<Config, String> {
-    let app = App::new(name)
+    let app = base_app(name, version, about).usage(usage);
+    let arg_list = args
+        .collect_str(InvalidEncodingHandling::ConvertLossy)
+        .accept_any();
+    Config::from(name, &app.get_matches_from(arg_list))
+}
+
+pub fn base_app<'a>(name: &str, version: &'a str, about: &'a str) -> App<'static, 'a> {
+    App::new(name)
         .version(version)
         .about(about)
-        .usage(usage)
         // Format arguments.
         .arg(
             Arg::with_name(options::DECODE)
@@ -106,17 +116,13 @@ pub fn parse_base_cmd_args(
         )
         // "multiple" arguments are used to check whether there is more than one
         // file passed in.
-        .arg(Arg::with_name(options::FILE).index(1).multiple(true));
-    let arg_list = args
-        .collect_str(InvalidEncodingHandling::ConvertLossy)
-        .accept_any();
-    Config::from(app.get_matches_from(arg_list))
+        .arg(Arg::with_name(options::FILE).index(1).multiple(true))
 }
 
 pub fn get_input<'a>(config: &Config, stdin_ref: &'a Stdin) -> Box<dyn Read + 'a> {
     match &config.to_read {
         Some(name) => {
-            let file_buf = safe_unwrap!(File::open(Path::new(name)));
+            let file_buf = crash_if_err!(1, File::open(Path::new(name)));
             Box::new(BufReader::new(file_buf)) // as Box<dyn Read>
         }
         None => {
@@ -139,8 +145,18 @@ pub fn handle_input<R: Read>(
     }
 
     if !decode {
-        let encoded = data.encode();
-        wrap_print(&data, encoded);
+        match data.encode() {
+            Ok(s) => {
+                wrap_print(&data, s);
+            }
+            Err(_) => {
+                eprintln!(
+                    "{}: error: invalid input (length must be multiple of 4 characters)",
+                    name
+                );
+                exit!(1)
+            }
+        }
     } else {
         match data.decode() {
             Ok(s) => {

@@ -14,9 +14,8 @@ use clap::{crate_version, App, Arg};
 use std::fs;
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
-use uucore::fs::{canonicalize, CanonicalizeMode};
+use uucore::fs::{canonicalize, MissingHandling, ResolveMode};
 
-const NAME: &str = "readlink";
 const ABOUT: &str = "Print value of a symbolic link or canonical file name.";
 const OPT_CANONICALIZE: &str = "canonicalize";
 const OPT_CANONICALIZE_MISSING: &str = "canonicalize-missing";
@@ -29,16 +28,98 @@ const OPT_ZERO: &str = "zero";
 
 const ARG_FILES: &str = "files";
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... [FILE]...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... [FILE]...", uucore::execution_phrase())
 }
 
 pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
-    let matches = App::new(executable!())
+    let usage = usage();
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+
+    let mut no_newline = matches.is_present(OPT_NO_NEWLINE);
+    let use_zero = matches.is_present(OPT_ZERO);
+    let silent = matches.is_present(OPT_SILENT) || matches.is_present(OPT_QUIET);
+    let verbose = matches.is_present(OPT_VERBOSE);
+
+    let res_mode = if matches.is_present(OPT_CANONICALIZE)
+        || matches.is_present(OPT_CANONICALIZE_EXISTING)
+        || matches.is_present(OPT_CANONICALIZE_MISSING)
+    {
+        ResolveMode::Logical
+    } else {
+        ResolveMode::None
+    };
+
+    let can_mode = if matches.is_present(OPT_CANONICALIZE_EXISTING) {
+        MissingHandling::Existing
+    } else if matches.is_present(OPT_CANONICALIZE_MISSING) {
+        MissingHandling::Missing
+    } else {
+        MissingHandling::Normal
+    };
+
+    let files: Vec<String> = matches
+        .values_of(ARG_FILES)
+        .map(|v| v.map(ToString::to_string).collect())
+        .unwrap_or_default();
+    if files.is_empty() {
+        crash!(
+            1,
+            "missing operand\nTry '{} --help' for more information",
+            uucore::execution_phrase()
+        );
+    }
+
+    if no_newline && files.len() > 1 && !silent {
+        eprintln!(
+            "{}: ignoring --no-newline with multiple arguments",
+            uucore::util_name()
+        );
+        no_newline = false;
+    }
+
+    for f in &files {
+        let p = PathBuf::from(f);
+        if res_mode == ResolveMode::None {
+            match fs::read_link(&p) {
+                Ok(path) => show(&path, no_newline, use_zero),
+                Err(err) => {
+                    if verbose {
+                        eprintln!(
+                            "{}: {}: errno {}",
+                            uucore::util_name(),
+                            f,
+                            err.raw_os_error().unwrap()
+                        );
+                    }
+                    return 1;
+                }
+            }
+        } else {
+            match canonicalize(&p, can_mode, res_mode) {
+                Ok(path) => show(&path, no_newline, use_zero),
+                Err(err) => {
+                    if verbose {
+                        eprintln!(
+                            "{}: {}: errno {:?}",
+                            uucore::util_name(),
+                            f,
+                            err.raw_os_error().unwrap()
+                        );
+                    }
+                    return 1;
+                }
+            }
+        }
+    }
+
+    0
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
         .arg(
             Arg::with_name(OPT_CANONICALIZE)
                 .short("f")
@@ -97,66 +178,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .help("separate output with NUL rather than newline"),
         )
         .arg(Arg::with_name(ARG_FILES).multiple(true).takes_value(true))
-        .get_matches_from(args);
-
-    let mut no_newline = matches.is_present(OPT_NO_NEWLINE);
-    let use_zero = matches.is_present(OPT_ZERO);
-    let silent = matches.is_present(OPT_SILENT) || matches.is_present(OPT_QUIET);
-    let verbose = matches.is_present(OPT_VERBOSE);
-
-    let can_mode = if matches.is_present(OPT_CANONICALIZE) {
-        CanonicalizeMode::Normal
-    } else if matches.is_present(OPT_CANONICALIZE_EXISTING) {
-        CanonicalizeMode::Existing
-    } else if matches.is_present(OPT_CANONICALIZE_MISSING) {
-        CanonicalizeMode::Missing
-    } else {
-        CanonicalizeMode::None
-    };
-
-    let files: Vec<String> = matches
-        .values_of(ARG_FILES)
-        .map(|v| v.map(ToString::to_string).collect())
-        .unwrap_or_default();
-    if files.is_empty() {
-        crash!(
-            1,
-            "missing operand\nTry {} --help for more information",
-            NAME
-        );
-    }
-
-    if no_newline && files.len() > 1 && !silent {
-        eprintln!("{}: ignoring --no-newline with multiple arguments", NAME);
-        no_newline = false;
-    }
-
-    for f in &files {
-        let p = PathBuf::from(f);
-        if can_mode == CanonicalizeMode::None {
-            match fs::read_link(&p) {
-                Ok(path) => show(&path, no_newline, use_zero),
-                Err(err) => {
-                    if verbose {
-                        eprintln!("{}: {}: errno {}", NAME, f, err.raw_os_error().unwrap());
-                    }
-                    return 1;
-                }
-            }
-        } else {
-            match canonicalize(&p, can_mode) {
-                Ok(path) => show(&path, no_newline, use_zero),
-                Err(err) => {
-                    if verbose {
-                        eprintln!("{}: {}: errno {:?}", NAME, f, err.raw_os_error().unwrap());
-                    }
-                    return 1;
-                }
-            }
-        }
-    }
-
-    0
 }
 
 fn show(path: &Path, no_newline: bool, use_zero: bool) {

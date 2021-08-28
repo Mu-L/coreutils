@@ -18,7 +18,6 @@ use std::process::Command;
 use uucore::libc::{self, chroot, setgid, setgroups, setuid};
 use uucore::{entries, InvalidEncodingHandling};
 
-static NAME: &str = "chroot";
 static ABOUT: &str = "Run COMMAND with root directory set to NEWROOT.";
 static SYNTAX: &str = "[OPTION]... NEWROOT [COMMAND [ARG]...]";
 
@@ -36,7 +35,63 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().get_matches_from(args);
+
+    let default_shell: &'static str = "/bin/sh";
+    let default_option: &'static str = "-i";
+    let user_shell = std::env::var("SHELL");
+
+    let newroot: &Path = match matches.value_of(options::NEWROOT) {
+        Some(v) => Path::new(v),
+        None => crash!(
+            1,
+            "Missing operand: NEWROOT\nTry '{} --help' for more information.",
+            uucore::execution_phrase()
+        ),
+    };
+
+    if !newroot.is_dir() {
+        crash!(
+            1,
+            "cannot change root directory to `{}`: no such directory",
+            newroot.display()
+        );
+    }
+
+    let commands = match matches.values_of(options::COMMAND) {
+        Some(v) => v.collect(),
+        None => vec![],
+    };
+
+    // TODO: refactor the args and command matching
+    // See: https://github.com/uutils/coreutils/pull/2365#discussion_r647849967
+    let command: Vec<&str> = match commands.len() {
+        1 => {
+            let shell: &str = match user_shell {
+                Err(_) => default_shell,
+                Ok(ref s) => s.as_ref(),
+            };
+            vec![shell, default_option]
+        }
+        _ => commands,
+    };
+
+    set_context(newroot, &matches);
+
+    let pstatus = Command::new(command[0])
+        .args(&command[1..])
+        .status()
+        .unwrap_or_else(|e| crash!(1, "Cannot exec: {}", e));
+
+    if pstatus.success() {
+        0
+    } else {
+        pstatus.code().unwrap_or(-1)
+    }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
         .usage(SYNTAX)
@@ -83,59 +138,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .multiple(true)
                 .index(2),
         )
-        .get_matches_from(args);
-
-    let default_shell: &'static str = "/bin/sh";
-    let default_option: &'static str = "-i";
-    let user_shell = std::env::var("SHELL");
-
-    let newroot: &Path = match matches.value_of(options::NEWROOT) {
-        Some(v) => Path::new(v),
-        None => crash!(
-            1,
-            "Missing operand: NEWROOT\nTry '{} --help' for more information.",
-            NAME
-        ),
-    };
-
-    if !newroot.is_dir() {
-        crash!(
-            1,
-            "cannot change root directory to `{}`: no such directory",
-            newroot.display()
-        );
-    }
-
-    let commands = match matches.values_of(options::COMMAND) {
-        Some(v) => v.collect(),
-        None => vec![],
-    };
-
-    // TODO: refactor the args and command matching
-    // See: https://github.com/uutils/coreutils/pull/2365#discussion_r647849967
-    let command: Vec<&str> = match commands.len() {
-        1 => {
-            let shell: &str = match user_shell {
-                Err(_) => default_shell,
-                Ok(ref s) => s.as_ref(),
-            };
-            vec![shell, default_option]
-        }
-        _ => commands,
-    };
-
-    set_context(newroot, &matches);
-
-    let pstatus = Command::new(command[0])
-        .args(&command[1..])
-        .status()
-        .unwrap_or_else(|e| crash!(1, "Cannot exec: {}", e));
-
-    if pstatus.success() {
-        0
-    } else {
-        pstatus.code().unwrap_or(-1)
-    }
 }
 
 fn set_context(root: &Path, options: &clap::ArgMatches) {

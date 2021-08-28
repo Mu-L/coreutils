@@ -10,6 +10,7 @@ extern crate uucore;
 
 use clap::{crate_version, App, Arg};
 use std::path::Path;
+use uucore::error::{UResult, UUsageError};
 use uucore::InvalidEncodingHandling;
 
 static ABOUT: &str = "strip last component from file name";
@@ -19,8 +20,8 @@ mod options {
     pub const DIR: &str = "dir";
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION] NAME...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION] NAME...", uucore::execution_phrase())
 }
 
 fn get_long_usage() -> String {
@@ -30,26 +31,18 @@ fn get_long_usage() -> String {
     )
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
-    let usage = get_usage();
+    let usage = usage();
     let after_help = get_long_usage();
 
-    let matches = App::new(executable!())
-        .about(ABOUT)
+    let matches = uu_app()
         .usage(&usage[..])
         .after_help(&after_help[..])
-        .version(crate_version!())
-        .arg(
-            Arg::with_name(options::ZERO)
-                .long(options::ZERO)
-                .short("z")
-                .help("separate output with NUL rather than newline"),
-        )
-        .arg(Arg::with_name(options::DIR).hidden(true).multiple(true))
         .get_matches_from(args);
 
     let separator = if matches.is_present(options::ZERO) {
@@ -86,9 +79,21 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             print!("{}", separator);
         }
     } else {
-        show_usage_error!("missing operand");
-        return 1;
+        return Err(UUsageError::new(1, "missing operand"));
     }
 
-    0
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .about(ABOUT)
+        .version(crate_version!())
+        .arg(
+            Arg::with_name(options::ZERO)
+                .long(options::ZERO)
+                .short("z")
+                .help("separate output with NUL rather than newline"),
+        )
+        .arg(Arg::with_name(options::DIR).hidden(true).multiple(true))
 }

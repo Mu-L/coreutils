@@ -21,8 +21,6 @@ use std::path::Path;
 use std::{char, fs::remove_file};
 use uucore::parse_size::parse_size;
 
-static NAME: &str = "split";
-
 static OPT_BYTES: &str = "bytes";
 static OPT_LINE_BYTES: &str = "line-bytes";
 static OPT_LINES: &str = "lines";
@@ -30,14 +28,17 @@ static OPT_ADDITIONAL_SUFFIX: &str = "additional-suffix";
 static OPT_FILTER: &str = "filter";
 static OPT_NUMERIC_SUFFIXES: &str = "numeric-suffixes";
 static OPT_SUFFIX_LENGTH: &str = "suffix-length";
-static OPT_DEFAULT_SUFFIX_LENGTH: usize = 2;
+static OPT_DEFAULT_SUFFIX_LENGTH: &str = "2";
 static OPT_VERBOSE: &str = "verbose";
 
 static ARG_INPUT: &str = "input";
 static ARG_PREFIX: &str = "prefix";
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... [INPUT [PREFIX]]", NAME)
+fn usage() -> String {
+    format!(
+        "{0} [OPTION]... [INPUT [PREFIX]]",
+        uucore::execution_phrase()
+    )
 }
 fn get_long_usage() -> String {
     format!(
@@ -47,20 +48,89 @@ fn get_long_usage() -> String {
 Output fixed-size pieces of INPUT to PREFIXaa, PREFIX ab, ...; default
 size is 1000, and default PREFIX is 'x'. With no INPUT, or when INPUT is
 -, read standard input.",
-        get_usage()
+        usage()
     )
 }
 
 pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+    let usage = usage();
     let long_usage = get_long_usage();
-    let default_suffix_length_str = OPT_DEFAULT_SUFFIX_LENGTH.to_string();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about("Create output files containing consecutive or interleaved sections of input")
+    let matches = uu_app()
         .usage(&usage[..])
         .after_help(&long_usage[..])
+        .get_matches_from(args);
+
+    let mut settings = Settings {
+        prefix: "".to_owned(),
+        numeric_suffix: false,
+        suffix_length: 0,
+        additional_suffix: "".to_owned(),
+        input: "".to_owned(),
+        filter: None,
+        strategy: "".to_owned(),
+        strategy_param: "".to_owned(),
+        verbose: false,
+    };
+
+    settings.suffix_length = matches
+        .value_of(OPT_SUFFIX_LENGTH)
+        .unwrap()
+        .parse()
+        .unwrap_or_else(|_| panic!("Invalid number for {}", OPT_SUFFIX_LENGTH));
+
+    settings.numeric_suffix = matches.occurrences_of(OPT_NUMERIC_SUFFIXES) > 0;
+    settings.additional_suffix = matches.value_of(OPT_ADDITIONAL_SUFFIX).unwrap().to_owned();
+
+    settings.verbose = matches.occurrences_of("verbose") > 0;
+    // check that the user is not specifying more than one strategy
+    // note: right now, this exact behavior cannot be handled by ArgGroup since ArgGroup
+    // considers a default value Arg as "defined"
+    let explicit_strategies =
+        vec![OPT_LINE_BYTES, OPT_LINES, OPT_BYTES]
+            .into_iter()
+            .fold(0, |count, strategy| {
+                if matches.occurrences_of(strategy) > 0 {
+                    count + 1
+                } else {
+                    count
+                }
+            });
+    if explicit_strategies > 1 {
+        crash!(1, "cannot split in more than one way");
+    }
+
+    // default strategy (if no strategy is passed, use this one)
+    settings.strategy = String::from(OPT_LINES);
+    settings.strategy_param = matches.value_of(OPT_LINES).unwrap().to_owned();
+    // take any (other) defined strategy
+    for &strategy in &[OPT_LINE_BYTES, OPT_BYTES] {
+        if matches.occurrences_of(strategy) > 0 {
+            settings.strategy = String::from(strategy);
+            settings.strategy_param = matches.value_of(strategy).unwrap().to_owned();
+        }
+    }
+
+    settings.input = matches.value_of(ARG_INPUT).unwrap().to_owned();
+    settings.prefix = matches.value_of(ARG_PREFIX).unwrap().to_owned();
+
+    if matches.occurrences_of(OPT_FILTER) > 0 {
+        if cfg!(windows) {
+            // see https://github.com/rust-lang/rust/issues/29494
+            show_error!("{} is currently not supported in this platform", OPT_FILTER);
+            exit!(-1);
+        } else {
+            settings.filter = Some(matches.value_of(OPT_FILTER).unwrap().to_owned());
+        }
+    }
+
+    split(&settings)
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about("Create output files containing consecutive or interleaved sections of input")
         // strategy (mutually exclusive)
         .arg(
             Arg::with_name(OPT_BYTES)
@@ -113,7 +183,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .short("a")
                 .long(OPT_SUFFIX_LENGTH)
                 .takes_value(true)
-                .default_value(default_suffix_length_str.as_str())
+                .default_value(OPT_DEFAULT_SUFFIX_LENGTH)
                 .help("use suffixes of length N (default 2)"),
         )
         .arg(
@@ -133,72 +203,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             .default_value("x")
             .index(2)
         )
-        .get_matches_from(args);
-
-    let mut settings = Settings {
-        prefix: "".to_owned(),
-        numeric_suffix: false,
-        suffix_length: 0,
-        additional_suffix: "".to_owned(),
-        input: "".to_owned(),
-        filter: None,
-        strategy: "".to_owned(),
-        strategy_param: "".to_owned(),
-        verbose: false,
-    };
-
-    settings.suffix_length = matches
-        .value_of(OPT_SUFFIX_LENGTH)
-        .unwrap()
-        .parse()
-        .unwrap_or_else(|_| panic!("Invalid number for {}", OPT_SUFFIX_LENGTH));
-
-    settings.numeric_suffix = matches.occurrences_of(OPT_NUMERIC_SUFFIXES) > 0;
-    settings.additional_suffix = matches.value_of(OPT_ADDITIONAL_SUFFIX).unwrap().to_owned();
-
-    settings.verbose = matches.occurrences_of("verbose") > 0;
-    // check that the user is not specifying more than one strategy
-    // note: right now, this exact behavior cannot be handled by ArgGroup since ArgGroup
-    // considers a default value Arg as "defined"
-    let explicit_strategies =
-        vec![OPT_LINE_BYTES, OPT_LINES, OPT_BYTES]
-            .into_iter()
-            .fold(0, |count, strategy| {
-                if matches.occurrences_of(strategy) > 0 {
-                    count + 1
-                } else {
-                    count
-                }
-            });
-    if explicit_strategies > 1 {
-        crash!(1, "cannot split in more than one way");
-    }
-
-    // default strategy (if no strategy is passed, use this one)
-    settings.strategy = String::from(OPT_LINES);
-    settings.strategy_param = matches.value_of(OPT_LINES).unwrap().to_owned();
-    // take any (other) defined strategy
-    for strategy in vec![OPT_LINE_BYTES, OPT_BYTES].into_iter() {
-        if matches.occurrences_of(strategy) > 0 {
-            settings.strategy = String::from(strategy);
-            settings.strategy_param = matches.value_of(strategy).unwrap().to_owned();
-        }
-    }
-
-    settings.input = matches.value_of(ARG_INPUT).unwrap().to_owned();
-    settings.prefix = matches.value_of(ARG_PREFIX).unwrap().to_owned();
-
-    if matches.occurrences_of(OPT_FILTER) > 0 {
-        if cfg!(windows) {
-            // see https://github.com/rust-lang/rust/issues/29494
-            show_error!("{} is currently not supported in this platform", OPT_FILTER);
-            exit!(-1);
-        } else {
-            settings.filter = Some(matches.value_of(OPT_FILTER).unwrap().to_owned());
-        }
-    }
-
-    split(&settings)
 }
 
 #[allow(dead_code)]
@@ -234,7 +238,7 @@ impl LineSplitter {
     fn new(settings: &Settings) -> LineSplitter {
         LineSplitter {
             lines_per_split: settings.strategy_param.parse().unwrap_or_else(|_| {
-                crash!(1, "invalid number of lines: ‘{}’", settings.strategy_param)
+                crash!(1, "invalid number of lines: '{}'", settings.strategy_param)
             }),
         }
     }

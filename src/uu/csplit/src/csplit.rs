@@ -34,8 +34,11 @@ mod options {
     pub const PATTERN: &str = "pattern";
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... FILE PATTERN...", executable!())
+fn usage() -> String {
+    format!(
+        "{0} [OPTION]... FILE PATTERN...",
+        uucore::execution_phrase()
+    )
 }
 
 /// Command line options for csplit.
@@ -565,7 +568,7 @@ mod tests {
                 assert_eq!(input_splitter.add_line_to_buffer(0, line), None);
                 assert_eq!(input_splitter.buffer_len(), 1);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         match input_splitter.next() {
@@ -574,7 +577,7 @@ mod tests {
                 assert_eq!(input_splitter.add_line_to_buffer(1, line), None);
                 assert_eq!(input_splitter.buffer_len(), 2);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         match input_splitter.next() {
@@ -586,7 +589,7 @@ mod tests {
                 );
                 assert_eq!(input_splitter.buffer_len(), 2);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         input_splitter.rewind_buffer();
@@ -596,7 +599,7 @@ mod tests {
                 assert_eq!(line, String::from("bbb"));
                 assert_eq!(input_splitter.buffer_len(), 1);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         match input_splitter.next() {
@@ -604,7 +607,7 @@ mod tests {
                 assert_eq!(line, String::from("ccc"));
                 assert_eq!(input_splitter.buffer_len(), 0);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         match input_splitter.next() {
@@ -612,7 +615,7 @@ mod tests {
                 assert_eq!(line, String::from("ddd"));
                 assert_eq!(input_splitter.buffer_len(), 0);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         assert!(input_splitter.next().is_none());
@@ -637,7 +640,7 @@ mod tests {
                 assert_eq!(input_splitter.add_line_to_buffer(0, line), None);
                 assert_eq!(input_splitter.buffer_len(), 1);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         match input_splitter.next() {
@@ -646,7 +649,7 @@ mod tests {
                 assert_eq!(input_splitter.add_line_to_buffer(1, line), None);
                 assert_eq!(input_splitter.buffer_len(), 2);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         match input_splitter.next() {
@@ -655,7 +658,7 @@ mod tests {
                 assert_eq!(input_splitter.add_line_to_buffer(2, line), None);
                 assert_eq!(input_splitter.buffer_len(), 3);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         input_splitter.rewind_buffer();
@@ -666,7 +669,7 @@ mod tests {
                 assert_eq!(input_splitter.add_line_to_buffer(0, line), None);
                 assert_eq!(input_splitter.buffer_len(), 3);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         match input_splitter.next() {
@@ -674,7 +677,7 @@ mod tests {
                 assert_eq!(line, String::from("aaa"));
                 assert_eq!(input_splitter.buffer_len(), 2);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         match input_splitter.next() {
@@ -682,7 +685,7 @@ mod tests {
                 assert_eq!(line, String::from("bbb"));
                 assert_eq!(input_splitter.buffer_len(), 1);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         match input_splitter.next() {
@@ -690,7 +693,7 @@ mod tests {
                 assert_eq!(line, String::from("ccc"));
                 assert_eq!(input_splitter.buffer_len(), 0);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         match input_splitter.next() {
@@ -698,7 +701,7 @@ mod tests {
                 assert_eq!(line, String::from("ddd"));
                 assert_eq!(input_splitter.buffer_len(), 0);
             }
-            item @ _ => panic!("wrong item: {:?}", item),
+            item => panic!("wrong item: {:?}", item),
         };
 
         assert!(input_splitter.next().is_none());
@@ -706,15 +709,42 @@ mod tests {
 }
 
 pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+    let usage = usage();
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+
+    // get the file to split
+    let file_name = matches.value_of(options::FILE).unwrap();
+
+    // get the patterns to split on
+    let patterns: Vec<String> = matches
+        .values_of(options::PATTERN)
+        .unwrap()
+        .map(str::to_string)
+        .collect();
+    let patterns = crash_if_err!(1, patterns::get_patterns(&patterns[..]));
+    let options = CsplitOptions::new(&matches);
+    if file_name == "-" {
+        let stdin = io::stdin();
+        crash_if_err!(1, csplit(&options, patterns, stdin.lock()));
+    } else {
+        let file = crash_if_err!(1, File::open(file_name));
+        let file_metadata = crash_if_err!(1, file.metadata());
+        if !file_metadata.is_file() {
+            crash!(1, "'{}' is not a regular file", file_name);
+        }
+        crash_if_err!(1, csplit(&options, patterns, BufReader::new(file)));
+    };
+    0
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(SUMMARY)
-        .usage(&usage[..])
         .arg(
             Arg::with_name(options::SUFFIX_FORMAT)
                 .short("b")
@@ -768,29 +798,4 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .required(true),
         )
         .after_help(LONG_HELP)
-        .get_matches_from(args);
-
-    // get the file to split
-    let file_name = matches.value_of(options::FILE).unwrap();
-
-    // get the patterns to split on
-    let patterns: Vec<String> = matches
-        .values_of(options::PATTERN)
-        .unwrap()
-        .map(str::to_string)
-        .collect();
-    let patterns = return_if_err!(1, patterns::get_patterns(&patterns[..]));
-    let options = CsplitOptions::new(&matches);
-    if file_name == "-" {
-        let stdin = io::stdin();
-        crash_if_err!(1, csplit(&options, patterns, stdin.lock()));
-    } else {
-        let file = return_if_err!(1, File::open(file_name));
-        let file_metadata = return_if_err!(1, file.metadata());
-        if !file_metadata.is_file() {
-            crash!(1, "'{}' is not a regular file", file_name);
-        }
-        crash_if_err!(1, csplit(&options, patterns, BufReader::new(file)));
-    };
-    0
 }

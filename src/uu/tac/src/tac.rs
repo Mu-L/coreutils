@@ -5,13 +5,14 @@
 //  * For the full copyright and license information, please view the LICENSE
 //  * file that was distributed with this source code.
 
-// spell-checker:ignore (ToDO) sbytes slen
+// spell-checker:ignore (ToDO) sbytes slen dlen memmem
 
 #[macro_use]
 extern crate uucore;
 
 use clap::{crate_version, App, Arg};
-use std::io::{stdin, stdout, BufReader, Read, Stdout, Write};
+use memchr::memmem;
+use std::io::{stdin, stdout, BufReader, Read, Write};
 use std::{fs::File, path::Path};
 use uucore::InvalidEncodingHandling;
 
@@ -31,7 +32,27 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().get_matches_from(args);
+
+    let before = matches.is_present(options::BEFORE);
+    let regex = matches.is_present(options::REGEX);
+    let raw_separator = matches.value_of(options::SEPARATOR).unwrap_or("\n");
+    let separator = if raw_separator.is_empty() {
+        "\0"
+    } else {
+        raw_separator
+    };
+
+    let files: Vec<String> = match matches.values_of(options::FILE) {
+        Some(v) => v.map(|v| v.to_owned()).collect(),
+        None => vec!["-".to_owned()],
+    };
+
+    tac(files, before, regex, separator)
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .name(NAME)
         .version(crate_version!())
         .usage(USAGE)
@@ -58,34 +79,60 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .takes_value(true),
         )
         .arg(Arg::with_name(options::FILE).hidden(true).multiple(true))
-        .get_matches_from(args);
+}
 
-    let before = matches.is_present(options::BEFORE);
-    let regex = matches.is_present(options::REGEX);
-    let separator = match matches.value_of(options::SEPARATOR) {
-        Some(m) => {
-            if m.is_empty() {
-                crash!(1, "separator cannot be empty")
-            } else {
-                m.to_owned()
-            }
+/// Write lines from `data` to stdout in reverse.
+///
+/// This function writes to [`stdout`] each line appearing in `data`,
+/// starting with the last line and ending with the first line. The
+/// `separator` parameter defines what characters to use as a line
+/// separator.
+///
+/// If `before` is `false`, then this function assumes that the
+/// `separator` appears at the end of each line, as in `"abc\ndef\n"`.
+/// If `before` is `true`, then this function assumes that the
+/// `separator` appears at the beginning of each line, as in
+/// `"/abc/def"`.
+fn buffer_tac(data: &[u8], before: bool, separator: &str) -> std::io::Result<()> {
+    let mut out = stdout();
+
+    // The number of bytes in the line separator.
+    let slen = separator.as_bytes().len();
+
+    // The index of the start of the next line in the `data`.
+    //
+    // As we scan through the `data` from right to left, we update this
+    // variable each time we find a new line.
+    //
+    // If `before` is `true`, then each line starts immediately before
+    // the line separator. Otherwise, each line starts immediately after
+    // the line separator.
+    let mut following_line_start = data.len();
+
+    // Iterate over each byte in the buffer in reverse. When we find a
+    // line separator, write the line to stdout.
+    //
+    // The `before` flag controls whether the line separator appears at
+    // the end of the line (as in "abc\ndef\n") or at the beginning of
+    // the line (as in "/abc/def").
+    for i in memmem::rfind_iter(data, separator) {
+        if before {
+            out.write_all(&data[i..following_line_start])?;
+            following_line_start = i;
+        } else {
+            out.write_all(&data[i + slen..following_line_start])?;
+            following_line_start = i + slen;
         }
-        None => "\n".to_owned(),
-    };
+    }
 
-    let files: Vec<String> = match matches.values_of(options::FILE) {
-        Some(v) => v.map(|v| v.to_owned()).collect(),
-        None => vec!["-".to_owned()],
-    };
-
-    tac(files, before, regex, &separator[..])
+    // After the loop terminates, write whatever bytes are remaining at
+    // the beginning of the buffer.
+    out.write_all(&data[0..following_line_start])?;
+    Ok(())
 }
 
 fn tac(filenames: Vec<String>, before: bool, _: bool, separator: &str) -> i32 {
     let mut exit_code = 0;
-    let mut out = stdout();
-    let sbytes = separator.as_bytes();
-    let slen = sbytes.len();
 
     for filename in &filenames {
         let mut file = BufReader::new(if filename == "-" {
@@ -94,7 +141,7 @@ fn tac(filenames: Vec<String>, before: bool, _: bool, separator: &str) -> i32 {
             let path = Path::new(filename);
             if path.is_dir() || path.metadata().is_err() {
                 if path.is_dir() {
-                    show_error!("dir: read error: Invalid argument");
+                    show_error!("{}: read error: Invalid argument", filename);
                 } else {
                     show_error!(
                         "failed to open '{}' for reading: No such file or directory",
@@ -121,56 +168,8 @@ fn tac(filenames: Vec<String>, before: bool, _: bool, separator: &str) -> i32 {
             continue;
         };
 
-        // find offsets in string of all separators
-        let mut offsets = Vec::new();
-        let mut i = 0;
-        loop {
-            if i + slen > data.len() {
-                break;
-            }
-
-            if &data[i..i + slen] == sbytes {
-                offsets.push(i);
-                i += slen;
-            } else {
-                i += 1;
-            }
-        }
-
-        // if there isn't a separator at the end of the file, fake it
-        if offsets.is_empty() || *offsets.last().unwrap() < data.len() - slen {
-            offsets.push(data.len());
-        }
-
-        let mut prev = *offsets.last().unwrap();
-        let mut start = true;
-        for off in offsets.iter().rev().skip(1) {
-            // correctly handle case of no final separator in file
-            if start && prev == data.len() {
-                show_line(&mut out, &[], &data[*off + slen..prev], before);
-                start = false;
-            } else {
-                show_line(&mut out, sbytes, &data[*off + slen..prev], before);
-            }
-            prev = *off;
-        }
-        show_line(&mut out, sbytes, &data[0..prev], before);
+        buffer_tac(&data, before, separator)
+            .unwrap_or_else(|e| crash!(1, "failed to write to stdout: {}", e));
     }
-
     exit_code
-}
-
-fn show_line(out: &mut Stdout, sep: &[u8], dat: &[u8], before: bool) {
-    if before {
-        out.write_all(sep)
-            .unwrap_or_else(|e| crash!(1, "failed to write to stdout: {}", e));
-    }
-
-    out.write_all(dat)
-        .unwrap_or_else(|e| crash!(1, "failed to write to stdout: {}", e));
-
-    if !before {
-        out.write_all(sep)
-            .unwrap_or_else(|e| crash!(1, "failed to write to stdout: {}", e));
-    }
 }

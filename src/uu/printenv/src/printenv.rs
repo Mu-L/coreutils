@@ -7,9 +7,6 @@
 
 /* last synced with: printenv (GNU coreutils) 8.13 */
 
-#[macro_use]
-extern crate uucore;
-
 use clap::{crate_version, App, Arg};
 use std::env;
 
@@ -19,30 +16,14 @@ static OPT_NULL: &str = "null";
 
 static ARG_VARIABLES: &str = "variables";
 
-fn get_usage() -> String {
-    format!("{0} [VARIABLE]... [OPTION]...", executable!())
+fn usage() -> String {
+    format!("{0} [VARIABLE]... [OPTION]...", uucore::execution_phrase())
 }
 
 pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+    let usage = usage();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(OPT_NULL)
-                .short("0")
-                .long(OPT_NULL)
-                .help("end each output line with 0 byte rather than newline"),
-        )
-        .arg(
-            Arg::with_name(ARG_VARIABLES)
-                .multiple(true)
-                .takes_value(true)
-                .min_values(1),
-        )
-        .get_matches_from(args);
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
 
     let variables: Vec<String> = matches
         .values_of(ARG_VARIABLES)
@@ -68,4 +49,22 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         }
     }
     0
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .arg(
+            Arg::with_name(OPT_NULL)
+                .short("0")
+                .long(OPT_NULL)
+                .help("end each output line with 0 byte rather than newline"),
+        )
+        .arg(
+            Arg::with_name(ARG_VARIABLES)
+                .multiple(true)
+                .takes_value(true)
+                .min_values(1),
+        )
 }

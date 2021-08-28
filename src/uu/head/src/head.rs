@@ -9,7 +9,7 @@ use clap::{crate_version, App, Arg};
 use std::convert::TryFrom;
 use std::ffi::OsString;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
-use uucore::{crash, executable, show_error, show_error_custom_description};
+use uucore::{crash, show_error_custom_description};
 
 const EXIT_FAILURE: i32 = 1;
 const EXIT_SUCCESS: i32 = 0;
@@ -40,8 +40,8 @@ mod take;
 use lines::zlines;
 use take::take_all_but;
 
-fn app<'a>() -> App<'a, 'a> {
-    App::new(executable!())
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
         .usage(USAGE)
@@ -167,7 +167,7 @@ impl HeadOptions {
 
     ///Construct options from matches
     pub fn get_from(args: impl uucore::Args) -> Result<Self, String> {
-        let matches = app().get_matches_from(arg_iterate(args)?);
+        let matches = uu_app().get_matches_from(arg_iterate(args)?);
 
         let mut options = HeadOptions::new();
 
@@ -483,7 +483,7 @@ mod tests {
     fn options(args: &str) -> Result<HeadOptions, String> {
         let combined = "head ".to_owned() + args;
         let args = combined.split_whitespace();
-        HeadOptions::get_from(args.map(|s| OsString::from(s)))
+        HeadOptions::get_from(args.map(OsString::from))
     }
     #[test]
     fn test_args_modes() {
@@ -522,6 +522,7 @@ mod tests {
         assert!(options("-c IsThisJustFantasy").is_err());
     }
     #[test]
+    #[allow(clippy::bool_comparison)]
     fn test_options_correct_defaults() {
         let opts = HeadOptions::new();
         let opts2: HeadOptions = Default::default();
@@ -552,7 +553,7 @@ mod tests {
         assert!(parse_mode("1T", Modes::Bytes).is_err());
     }
     fn arg_outputs(src: &str) -> Result<String, String> {
-        let split = src.split_whitespace().map(|x| OsString::from(x));
+        let split = src.split_whitespace().map(OsString::from);
         match arg_iterate(split) {
             Ok(args) => {
                 let vec = args

@@ -106,3 +106,56 @@ fn test_realpath_file_and_links_strip_zero() {
         .succeeds()
         .stdout_contains("bar\u{0}");
 }
+
+#[test]
+fn test_realpath_physical_mode() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+
+    at.mkdir("dir1");
+    at.mkdir_all("dir2/bar");
+    at.symlink_dir("dir2/bar", "dir1/foo");
+
+    scene
+        .ucmd()
+        .arg("dir1/foo/..")
+        .succeeds()
+        .stdout_contains("dir2\n");
+}
+
+#[test]
+fn test_realpath_logical_mode() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+
+    at.mkdir("dir1");
+    at.mkdir("dir2");
+    at.symlink_dir("dir2", "dir1/foo");
+
+    scene
+        .ucmd()
+        .arg("-L")
+        .arg("dir1/foo/..")
+        .succeeds()
+        .stdout_contains("dir1\n");
+}
+
+#[test]
+fn test_realpath_dangling() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.symlink_file("nonexistent-file", "link");
+    ucmd.arg("link")
+        .succeeds()
+        .stdout_only(at.plus_as_string("nonexistent-file\n"));
+}
+
+#[test]
+fn test_realpath_loop() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.symlink_file("2", "1");
+    at.symlink_file("3", "2");
+    at.symlink_file("1", "3");
+    ucmd.arg("1")
+        .succeeds()
+        .stdout_only(at.plus_as_string("2\n"));
+}

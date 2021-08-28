@@ -8,14 +8,11 @@
 
 // spell-checker:ignore (chrono) Datelike Timelike ; (format) DATEFILE MMDDhhmm ; (vars) datetime datetimes
 
-#[macro_use]
-extern crate uucore;
-
 use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 #[cfg(windows)]
 use chrono::{Datelike, Timelike};
 use clap::{crate_version, App, Arg};
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "redox")))]
 use libc::{clock_settime, timespec, CLOCK_REALTIME};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -67,10 +64,12 @@ static RFC_3339_HELP_STRING: &str = "output date/time in RFC 3339 format.
  for date and time to the indicated precision.
  Example: 2006-08-14 02:34:56-06:00";
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "redox")))]
 static OPT_SET_HELP_STRING: &str = "set time described by STRING";
 #[cfg(target_os = "macos")]
 static OPT_SET_HELP_STRING: &str = "set time described by STRING (not available on mac yet)";
+#[cfg(target_os = "redox")]
+static OPT_SET_HELP_STRING: &str = "set time described by STRING (not available on redox yet)";
 
 /// Settings for this program, parsed from the command line
 struct Settings {
@@ -142,75 +141,11 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
  {0} [OPTION]... [MMDDhhmm[[CC]YY][.ss]]",
         NAME
     );
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
-        .usage(&syntax[..])
-        .arg(
-            Arg::with_name(OPT_DATE)
-                .short("d")
-                .long(OPT_DATE)
-                .takes_value(true)
-                .help("display time described by STRING, not 'now'"),
-        )
-        .arg(
-            Arg::with_name(OPT_FILE)
-                .short("f")
-                .long(OPT_FILE)
-                .takes_value(true)
-                .help("like --date; once for each line of DATEFILE"),
-        )
-        .arg(
-            Arg::with_name(OPT_ISO_8601)
-                .short("I")
-                .long(OPT_ISO_8601)
-                .takes_value(true)
-                .help(ISO_8601_HELP_STRING),
-        )
-        .arg(
-            Arg::with_name(OPT_RFC_EMAIL)
-                .short("R")
-                .long(OPT_RFC_EMAIL)
-                .help(RFC_5322_HELP_STRING),
-        )
-        .arg(
-            Arg::with_name(OPT_RFC_3339)
-                .long(OPT_RFC_3339)
-                .takes_value(true)
-                .help(RFC_3339_HELP_STRING),
-        )
-        .arg(
-            Arg::with_name(OPT_DEBUG)
-                .long(OPT_DEBUG)
-                .help("annotate the parsed date, and warn about questionable usage to stderr"),
-        )
-        .arg(
-            Arg::with_name(OPT_REFERENCE)
-                .short("r")
-                .long(OPT_REFERENCE)
-                .takes_value(true)
-                .help("display the last modification time of FILE"),
-        )
-        .arg(
-            Arg::with_name(OPT_SET)
-                .short("s")
-                .long(OPT_SET)
-                .takes_value(true)
-                .help(OPT_SET_HELP_STRING),
-        )
-        .arg(
-            Arg::with_name(OPT_UNIVERSAL)
-                .short("u")
-                .long(OPT_UNIVERSAL)
-                .alias(OPT_UNIVERSAL_2)
-                .help("print or set Coordinated Universal Time (UTC)"),
-        )
-        .arg(Arg::with_name(OPT_FORMAT).multiple(false))
-        .get_matches_from(args);
+    let matches = uu_app().usage(&syntax[..]).get_matches_from(args);
 
     let format = if let Some(form) = matches.value_of(OPT_FORMAT) {
         if !form.starts_with('+') {
-            eprintln!("date: invalid date ‘{}’", form);
+            eprintln!("date: invalid date '{}'", form);
             return 1;
         }
         let form = form[1..].to_string();
@@ -239,7 +174,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     let set_to = match matches.value_of(OPT_SET).map(parse_date) {
         None => None,
         Some(Err((input, _err))) => {
-            eprintln!("date: invalid date ‘{}’", input);
+            eprintln!("date: invalid date '{}'", input);
             return 1;
         }
         Some(Ok(date)) => Some(date),
@@ -305,13 +240,79 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     println!("{}", formatted);
                 }
                 Err((input, _err)) => {
-                    println!("date: invalid date ‘{}’", input);
+                    println!("date: invalid date '{}'", input);
                 }
             }
         }
     }
 
     0
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .arg(
+            Arg::with_name(OPT_DATE)
+                .short("d")
+                .long(OPT_DATE)
+                .takes_value(true)
+                .help("display time described by STRING, not 'now'"),
+        )
+        .arg(
+            Arg::with_name(OPT_FILE)
+                .short("f")
+                .long(OPT_FILE)
+                .takes_value(true)
+                .help("like --date; once for each line of DATEFILE"),
+        )
+        .arg(
+            Arg::with_name(OPT_ISO_8601)
+                .short("I")
+                .long(OPT_ISO_8601)
+                .takes_value(true)
+                .help(ISO_8601_HELP_STRING),
+        )
+        .arg(
+            Arg::with_name(OPT_RFC_EMAIL)
+                .short("R")
+                .long(OPT_RFC_EMAIL)
+                .help(RFC_5322_HELP_STRING),
+        )
+        .arg(
+            Arg::with_name(OPT_RFC_3339)
+                .long(OPT_RFC_3339)
+                .takes_value(true)
+                .help(RFC_3339_HELP_STRING),
+        )
+        .arg(
+            Arg::with_name(OPT_DEBUG)
+                .long(OPT_DEBUG)
+                .help("annotate the parsed date, and warn about questionable usage to stderr"),
+        )
+        .arg(
+            Arg::with_name(OPT_REFERENCE)
+                .short("r")
+                .long(OPT_REFERENCE)
+                .takes_value(true)
+                .help("display the last modification time of FILE"),
+        )
+        .arg(
+            Arg::with_name(OPT_SET)
+                .short("s")
+                .long(OPT_SET)
+                .takes_value(true)
+                .help(OPT_SET_HELP_STRING),
+        )
+        .arg(
+            Arg::with_name(OPT_UNIVERSAL)
+                .short("u")
+                .long(OPT_UNIVERSAL)
+                .alias(OPT_UNIVERSAL_2)
+                .help("print or set Coordinated Universal Time (UTC)"),
+        )
+        .arg(Arg::with_name(OPT_FORMAT).multiple(false))
 }
 
 /// Return the appropriate format string for the given settings.
@@ -355,7 +356,13 @@ fn set_system_datetime(_date: DateTime<Utc>) -> i32 {
     1
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "redox")]
+fn set_system_datetime(_date: DateTime<Utc>) -> i32 {
+    eprintln!("date: setting the date is not supported by Redox");
+    1
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "redox")))]
 /// System call to set date (unix).
 /// See here for more:
 /// https://doc.rust-lang.org/libc/i686-unknown-linux-gnu/libc/fn.clock_settime.html

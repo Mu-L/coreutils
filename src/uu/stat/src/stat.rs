@@ -24,7 +24,7 @@ use std::{cmp, fs, iter};
 macro_rules! check_bound {
     ($str: ident, $bound:expr, $beg: expr, $end: expr) => {
         if $end >= $bound {
-            return Err(format!("‘{}’: invalid directive", &$str[$beg..$end]));
+            return Err(format!("'{}': invalid directive", &$str[$beg..$end]));
         }
     };
 }
@@ -436,6 +436,7 @@ impl Stater {
                             'f' => tokens.push(Token::Char('\x0C')),
                             'n' => tokens.push(Token::Char('\n')),
                             'r' => tokens.push(Token::Char('\r')),
+                            't' => tokens.push(Token::Char('\t')),
                             'v' => tokens.push(Token::Char('\x0B')),
                             c => {
                                 show_warning!("unrecognized escape '\\{}'", c);
@@ -881,8 +882,8 @@ impl Stater {
     }
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... FILE...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... FILE...", uucore::execution_phrase())
 }
 
 fn get_long_usage() -> String {
@@ -944,14 +945,27 @@ for details about the options it supports.
 }
 
 pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+    let usage = usage();
     let long_usage = get_long_usage();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
+    let matches = uu_app()
         .usage(&usage[..])
         .after_help(&long_usage[..])
+        .get_matches_from(args);
+
+    match Stater::new(matches) {
+        Ok(stater) => stater.exec(),
+        Err(e) => {
+            show_error!("{}", e);
+            1
+        }
+    }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
         .arg(
             Arg::with_name(options::DEREFERENCE)
                 .short("L")
@@ -996,13 +1010,4 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .takes_value(true)
                 .min_values(1),
         )
-        .get_matches_from(args);
-
-    match Stater::new(matches) {
-        Ok(stater) => stater.exec(),
-        Err(e) => {
-            show_error!("{}", e);
-            1
-        }
-    }
 }

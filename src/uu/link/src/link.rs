@@ -19,8 +19,8 @@ pub mod options {
     pub static FILES: &str = "FILES";
 }
 
-fn get_usage() -> String {
-    format!("{0} FILE1 FILE2", executable!())
+fn usage() -> String {
+    format!("{0} FILE1 FILE2", uucore::execution_phrase())
 }
 
 pub fn normalize_error_message(e: Error) -> String {
@@ -31,20 +31,8 @@ pub fn normalize_error_message(e: Error) -> String {
 }
 
 pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::FILES)
-                .hidden(true)
-                .required(true)
-                .min_values(2)
-                .max_values(2)
-                .takes_value(true),
-        )
-        .get_matches_from(args);
+    let usage = usage();
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
 
     let files: Vec<_> = matches
         .values_of_os(options::FILES)
@@ -60,4 +48,18 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             1
         }
     }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .arg(
+            Arg::with_name(options::FILES)
+                .hidden(true)
+                .required(true)
+                .min_values(2)
+                .max_values(2)
+                .takes_value(true),
+        )
 }

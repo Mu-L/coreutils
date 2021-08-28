@@ -3,14 +3,6 @@
 // Copyright (C) ~ Alex Lyon <arcterus@mail.com>
 // Copyright (C) ~ Roy Ivy III <rivy.dev@gmail.com>; MIT license
 
-// * feature-gated external crates
-#[cfg(all(feature = "lazy_static", target_os = "linux"))]
-extern crate lazy_static;
-#[cfg(feature = "nix")]
-extern crate nix;
-#[cfg(feature = "platform-info")]
-extern crate platform_info;
-
 // * feature-gated external crates (re-shared as public internal modules)
 #[cfg(feature = "libc")]
 pub extern crate libc;
@@ -27,9 +19,11 @@ mod parser; // string parsing modules
 // * cross-platform modules
 pub use crate::mods::backup_control;
 pub use crate::mods::coreopts;
+pub use crate::mods::error;
 pub use crate::mods::os;
 pub use crate::mods::panic;
 pub use crate::mods::ranges;
+pub use crate::mods::version_cmp;
 
 // * string parsing modules
 pub use crate::parser::parse_size;
@@ -44,8 +38,6 @@ pub use crate::features::fs;
 pub use crate::features::fsext;
 #[cfg(feature = "ringbuffer")]
 pub use crate::features::ringbuffer;
-#[cfg(feature = "zero-copy")]
-pub use crate::features::zero_copy;
 
 // * (platform-specific) feature-gated modules
 // ** non-windows
@@ -63,6 +55,7 @@ pub use crate::features::signals;
 #[cfg(all(
     unix,
     not(target_os = "fuchsia"),
+    not(target_os = "redox"),
     not(target_env = "musl"),
     feature = "utmpx"
 ))]
@@ -74,6 +67,47 @@ pub use crate::features::wide;
 //## core functions
 
 use std::ffi::OsString;
+use std::sync::atomic::Ordering;
+
+pub fn get_utility_is_second_arg() -> bool {
+    crate::macros::UTILITY_IS_SECOND_ARG.load(Ordering::SeqCst)
+}
+
+pub fn set_utility_is_second_arg() {
+    crate::macros::UTILITY_IS_SECOND_ARG.store(true, Ordering::SeqCst)
+}
+
+/// Get the executable path (as `OsString`).
+fn executable_os() -> OsString {
+    args_os().next().unwrap()
+}
+
+/// Get the executable path (as `String`).
+fn executable() -> String {
+    executable_os().to_string_lossy().into_owned()
+}
+
+/// Derive the utility name.
+pub fn util_name() -> String {
+    if get_utility_is_second_arg() {
+        args_os().nth(1).unwrap().to_string_lossy().into_owned()
+    } else {
+        executable()
+    }
+}
+
+/// Derive the complete execution phrase for "usage".
+pub fn execution_phrase() -> String {
+    if get_utility_is_second_arg() {
+        args_os()
+            .take(2)
+            .map(|os_str| os_str.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        executable()
+    }
+}
 
 pub enum InvalidEncodingHandling {
     Ignore,

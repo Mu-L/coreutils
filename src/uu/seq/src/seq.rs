@@ -22,12 +22,12 @@ static OPT_WIDTHS: &str = "widths";
 
 static ARG_NUMBERS: &str = "numbers";
 
-fn get_usage() -> String {
+fn usage() -> String {
     format!(
         "{0} [OPTION]... LAST
     {0} [OPTION]... FIRST LAST
     {0} [OPTION]... FIRST INCREMENT LAST",
-        executable!()
+        uucore::execution_phrase()
     )
 }
 #[derive(Clone)]
@@ -38,6 +38,8 @@ struct SeqOptions {
 }
 
 enum Number {
+    /// Negative zero, as if it were an integer.
+    MinusZero,
     BigInt(BigInt),
     F64(f64),
 }
@@ -45,6 +47,7 @@ enum Number {
 impl Number {
     fn is_zero(&self) -> bool {
         match self {
+            Number::MinusZero => true,
             Number::BigInt(n) => n.is_zero(),
             Number::F64(n) => n.is_zero(),
         }
@@ -52,6 +55,7 @@ impl Number {
 
     fn into_f64(self) -> f64 {
         match self {
+            Number::MinusZero => -0.,
             // BigInt::to_f64() can not return None.
             Number::BigInt(n) => n.to_f64().unwrap(),
             Number::F64(n) => n,
@@ -67,31 +71,130 @@ impl FromStr for Number {
         }
 
         match s.parse::<BigInt>() {
-            Ok(n) => Ok(Number::BigInt(n)),
+            Ok(n) => {
+                // If `s` is '-0', then `parse()` returns
+                // `BigInt::zero()`, but we need to return
+                // `Number::MinusZero` instead.
+                if n == BigInt::zero() && s.starts_with('-') {
+                    Ok(Number::MinusZero)
+                } else {
+                    Ok(Number::BigInt(n))
+                }
+            }
             Err(_) => match s.parse::<f64>() {
                 Ok(value) if value.is_nan() => Err(format!(
                     "invalid 'not-a-number' argument: '{}'\nTry '{} --help' for more information.",
                     s,
-                    executable!(),
+                    uucore::execution_phrase(),
                 )),
                 Ok(value) => Ok(Number::F64(value)),
                 Err(_) => Err(format!(
                     "invalid floating point argument: '{}'\nTry '{} --help' for more information.",
                     s,
-                    executable!(),
+                    uucore::execution_phrase(),
                 )),
             },
         }
     }
 }
 
+/// A range of integers.
+///
+/// The elements are (first, increment, last).
+type RangeInt = (BigInt, BigInt, BigInt);
+
+/// A range of f64.
+///
+/// The elements are (first, increment, last).
+type RangeF64 = (f64, f64, f64);
+
 pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
-    let matches = App::new(executable!())
+    let usage = usage();
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+
+    let numbers = matches.values_of(ARG_NUMBERS).unwrap().collect::<Vec<_>>();
+
+    let options = SeqOptions {
+        separator: matches.value_of(OPT_SEPARATOR).unwrap_or("\n").to_string(),
+        terminator: matches.value_of(OPT_TERMINATOR).unwrap_or("\n").to_string(),
+        widths: matches.is_present(OPT_WIDTHS),
+    };
+
+    let mut largest_dec = 0;
+    let mut padding = 0;
+    let first = if numbers.len() > 1 {
+        let slice = numbers[0];
+        let len = slice.len();
+        let dec = slice.find('.').unwrap_or(len);
+        largest_dec = len - dec;
+        padding = dec;
+        crash_if_err!(1, slice.parse())
+    } else {
+        Number::BigInt(BigInt::one())
+    };
+    let increment = if numbers.len() > 2 {
+        let slice = numbers[1];
+        let len = slice.len();
+        let dec = slice.find('.').unwrap_or(len);
+        largest_dec = cmp::max(largest_dec, len - dec);
+        padding = cmp::max(padding, dec);
+        crash_if_err!(1, slice.parse())
+    } else {
+        Number::BigInt(BigInt::one())
+    };
+    if increment.is_zero() {
+        show_error!(
+            "invalid Zero increment value: '{}'\nTry '{} --help' for more information.",
+            numbers[1],
+            uucore::execution_phrase()
+        );
+        return 1;
+    }
+    let last = {
+        let slice = numbers[numbers.len() - 1];
+        padding = cmp::max(padding, slice.find('.').unwrap_or_else(|| slice.len()));
+        crash_if_err!(1, slice.parse())
+    };
+    if largest_dec > 0 {
+        largest_dec -= 1;
+    }
+
+    match (first, last, increment) {
+        (Number::MinusZero, Number::BigInt(last), Number::BigInt(increment)) => print_seq_integers(
+            (BigInt::zero(), increment, last),
+            options.separator,
+            options.terminator,
+            options.widths,
+            padding,
+            true,
+        ),
+        (Number::BigInt(first), Number::BigInt(last), Number::BigInt(increment)) => {
+            print_seq_integers(
+                (first, increment, last),
+                options.separator,
+                options.terminator,
+                options.widths,
+                padding,
+                false,
+            )
+        }
+        (first, last, increment) => print_seq(
+            (first.into_f64(), increment.into_f64(), last.into_f64()),
+            largest_dec,
+            options.separator,
+            options.terminator,
+            options.widths,
+            padding,
+        ),
+    }
+    0
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .setting(AppSettings::AllowLeadingHyphen)
         .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
         .arg(
             Arg::with_name(OPT_SEPARATOR)
                 .short("s")
@@ -122,79 +225,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .max_values(3)
                 .required(true),
         )
-        .get_matches_from(args);
-
-    let numbers = matches.values_of(ARG_NUMBERS).unwrap().collect::<Vec<_>>();
-
-    let options = SeqOptions {
-        separator: matches.value_of(OPT_SEPARATOR).unwrap_or("\n").to_string(),
-        terminator: matches.value_of(OPT_TERMINATOR).unwrap_or("\n").to_string(),
-        widths: matches.is_present(OPT_WIDTHS),
-    };
-
-    let mut largest_dec = 0;
-    let mut padding = 0;
-    let first = if numbers.len() > 1 {
-        let slice = numbers[0];
-        let len = slice.len();
-        let dec = slice.find('.').unwrap_or(len);
-        largest_dec = len - dec;
-        padding = dec;
-        return_if_err!(1, slice.parse())
-    } else {
-        Number::BigInt(BigInt::one())
-    };
-    let increment = if numbers.len() > 2 {
-        let slice = numbers[1];
-        let len = slice.len();
-        let dec = slice.find('.').unwrap_or(len);
-        largest_dec = cmp::max(largest_dec, len - dec);
-        padding = cmp::max(padding, dec);
-        return_if_err!(1, slice.parse())
-    } else {
-        Number::BigInt(BigInt::one())
-    };
-    if increment.is_zero() {
-        show_error!(
-            "invalid Zero increment value: '{}'\nTry '{} --help' for more information.",
-            numbers[1],
-            executable!()
-        );
-        return 1;
-    }
-    let last = {
-        let slice = numbers[numbers.len() - 1];
-        padding = cmp::max(padding, slice.find('.').unwrap_or_else(|| slice.len()));
-        return_if_err!(1, slice.parse())
-    };
-    if largest_dec > 0 {
-        largest_dec -= 1;
-    }
-
-    match (first, last, increment) {
-        (Number::BigInt(first), Number::BigInt(last), Number::BigInt(increment)) => {
-            print_seq_integers(
-                first,
-                increment,
-                last,
-                options.separator,
-                options.terminator,
-                options.widths,
-                padding,
-            )
-        }
-        (first, last, increment) => print_seq(
-            first.into_f64(),
-            increment.into_f64(),
-            last.into_f64(),
-            largest_dec,
-            options.separator,
-            options.terminator,
-            options.widths,
-            padding,
-        ),
-    }
-    0
 }
 
 fn done_printing<T: Num + PartialOrd>(next: &T, increment: &T, last: &T) -> bool {
@@ -206,17 +236,15 @@ fn done_printing<T: Num + PartialOrd>(next: &T, increment: &T, last: &T) -> bool
 }
 
 /// Floating point based code path
-#[allow(clippy::too_many_arguments)]
 fn print_seq(
-    first: f64,
-    increment: f64,
-    last: f64,
+    range: RangeF64,
     largest_dec: usize,
     separator: String,
     terminator: String,
     pad: bool,
     padding: usize,
 ) {
+    let (first, increment, last) = range;
     let mut i = 0isize;
     let mut value = first + i as f64 * increment;
     while !done_printing(&value, &increment, &last) {
@@ -241,21 +269,37 @@ fn print_seq(
     crash_if_err!(1, stdout().flush());
 }
 
-/// BigInt based code path
+/// Print an integer sequence.
+///
+/// This function prints a sequence of integers defined by `range`,
+/// which defines the first integer, last integer, and increment of the
+/// range. The `separator` is inserted between each integer and
+/// `terminator` is inserted at the end.
+///
+/// The `pad` parameter indicates whether to pad numbers to the width
+/// given in `padding`.
+///
+/// If `is_first_minus_zero` is `true`, then the `first` parameter is
+/// printed as if it were negative zero, even though no such number
+/// exists as an integer (negative zero only exists for floating point
+/// numbers). Only set this to `true` if `first` is actually zero.
 fn print_seq_integers(
-    first: BigInt,
-    increment: BigInt,
-    last: BigInt,
+    range: RangeInt,
     separator: String,
     terminator: String,
     pad: bool,
     padding: usize,
+    is_first_minus_zero: bool,
 ) {
+    let (first, increment, last) = range;
     let mut value = first;
     let mut is_first_iteration = true;
     while !done_printing(&value, &increment, &last) {
         if !is_first_iteration {
             print!("{}", separator);
+        }
+        if is_first_iteration && is_first_minus_zero {
+            print!("-");
         }
         is_first_iteration = false;
         if pad {

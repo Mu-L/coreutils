@@ -7,12 +7,14 @@ name: CICD
 # spell-checker:ignore (shell/tools) choco clippy dmake dpkg esac fakeroot gmake grcov halium lcov libssl mkdir popd printf pushd rustc rustfmt rustup shopt xargs
 # spell-checker:ignore (misc) aarch alnum armhf bindir busytest coreutils gnueabihf issuecomment maint nullglob onexitbegin onexitend runtest tempfile testsuite uutils
 
+# ToDO: [2021-06; rivy] change from `cargo-tree` to `cargo tree` once MSRV is >= 1.45
+
 env:
   PROJECT_NAME: coreutils
   PROJECT_DESC: "Core universal (cross-platform) utilities"
   PROJECT_AUTH: "uutils"
-  RUST_MIN_SRV: "1.43.1" ## v1.43.0
-  RUST_COV_SRV: "2020-08-01" ## (~v1.47.0) supported rust version for code coverage; (date required/used by 'coverage') ## !maint: refactor when code coverage support is included in the stable channel
+  RUST_MIN_SRV: "1.47.0" ## MSRV v1.47.0
+  RUST_COV_SRV: "2021-05-06" ## (~v1.52.0) supported rust version for code coverage; (date required/used by 'coverage') ## !maint: refactor when code coverage support is included in the stable channel
 
 on: [push, pull_request]
 
@@ -100,11 +102,17 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          - { os: ubuntu-latest  , features: feat_os_unix }
+          - { os: ubuntu-latest }
           - { os: macos-latest   , features: feat_os_macos }
           - { os: windows-latest , features: feat_os_windows }
     steps:
     - uses: actions/checkout@v2
+    - name: Install/setup prerequisites
+      shell: bash
+      run: |
+        case '${{ matrix.job.os }}' in
+          macos-latest) brew install coreutils ;; # needed for show-utils.sh
+        esac
     - name: Initialize workflow variables
       id: vars
       shell: bash
@@ -113,9 +121,14 @@ jobs:
         outputs() { step_id="vars"; for var in "$@" ; do echo steps.${step_id}.outputs.${var}="${!var}"; echo ::set-output name=${var}::${!var}; done; }
         # target-specific options
         # * CARGO_FEATURES_OPTION
-        CARGO_FEATURES_OPTION='' ;
-        if [ -n "${{ matrix.job.features }}" ]; then CARGO_FEATURES_OPTION='--features "${{ matrix.job.features }}"' ; fi
+        CARGO_FEATURES_OPTION='--all-features' ;
+        if [ -n "${{ matrix.job.features }}" ]; then CARGO_FEATURES_OPTION='--features ${{ matrix.job.features }}' ; fi
         outputs CARGO_FEATURES_OPTION
+        # * determine sub-crate utility list
+        UTILITY_LIST="$(./util/show-utils.sh ${CARGO_FEATURES_OPTION})"
+        echo UTILITY_LIST=${UTILITY_LIST}
+        CARGO_UTILITY_LIST_OPTIONS="$(for u in ${UTILITY_LIST}; do echo "-puu_${u}"; done;)"
+        outputs CARGO_UTILITY_LIST_OPTIONS
     - name: Install `rust` toolchain
       uses: actions-rs/toolchain@v1
       with:
@@ -128,7 +141,7 @@ jobs:
       run: |
         ## `clippy` lint testing
         # * convert any warnings to GHA UI annotations; ref: <https://help.github.com/en/actions/reference/workflow-commands-for-github-actions#setting-a-warning-message>
-        S=$(cargo +nightly clippy --all-targets ${{ matrix.job.cargo-options }} ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} -- -D warnings 2>&1) && printf "%s\n" "$S" || { printf "%s\n" "$S" ; printf "%s" "$S" | sed -E -n -e '/^error:/{' -e "N; s/^error:[[:space:]]+(.*)\\n[[:space:]]+-->[[:space:]]+${PWD//\//\\/}\/(.*):([0-9]+):([0-9]+).*$/::error file=\2,line=\3,col=\4::ERROR: \`cargo clippy\`: \1 (file:'\2', line:\3)/p;" -e '}' ; exit 1 ; }
+        S=$(cargo +nightly clippy --all-targets ${{ steps.vars.outputs.CARGO_UTILITY_LIST_OPTIONS }} ${{ matrix.job.cargo-options }} ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} -- -D warnings 2>&1) && printf "%s\n" "$S" || { printf "%s\n" "$S" ; printf "%s" "$S" | sed -E -n -e '/^error:/{' -e "N; s/^error:[[:space:]]+(.*)\\n[[:space:]]+-->[[:space:]]+${PWD//\//\\/}\/(.*):([0-9]+):([0-9]+).*$/::error file=\2,line=\3,col=\4::ERROR: \`cargo clippy\`: \1 (file:'\2', line:\3)/p;" -e '}' ; exit 1 ; }
 
   code_spellcheck:
     name: Style/spelling
@@ -189,7 +202,7 @@ jobs:
         # tooling info display
         echo "## tooling"
         which gcc >/dev/null 2>&1 && (gcc --version | head -1) || true
-        rustup -V
+        rustup -V 2>/dev/null
         rustup show active-toolchain
         cargo -V
         rustc -V
@@ -198,7 +211,7 @@ jobs:
         echo "## dependency list"
         cargo fetch --locked --quiet
         ## * using the 'stable' toolchain is necessary to avoid "unexpected '--filter-platform'" errors
-        RUSTUP_TOOLCHAIN=stable cargo-tree tree --frozen --all --no-dev-dependencies --no-indent --features ${{ matrix.job.features }} | grep -vE "$PWD" | sort --unique
+        RUSTUP_TOOLCHAIN=stable cargo-tree tree --locked --all --no-dev-dependencies --no-indent --features ${{ matrix.job.features }} | grep -vE "$PWD" | sort --unique
     - name: Test
       uses: actions-rs/cargo@v1
       with:
@@ -247,6 +260,8 @@ jobs:
           # { os, target, cargo-options, features, use-cross, toolchain }
           - { os: ubuntu-latest  , target: arm-unknown-linux-gnueabihf , features: feat_os_unix_gnueabihf , use-cross: use-cross }
           - { os: ubuntu-latest  , target: aarch64-unknown-linux-gnu   , features: feat_os_unix_gnueabihf , use-cross: use-cross }
+          - { os: ubuntu-latest  , target: x86_64-unknown-linux-gnu    , features: feat_os_unix           , use-cross: use-cross }
+          # - { os: ubuntu-latest  , target: x86_64-unknown-linux-gnu    , features: feat_selinux           , use-cross: use-cross }
           # - { os: ubuntu-18.04   , target: i586-unknown-linux-gnu      , features: feat_os_unix           , use-cross: use-cross } ## note: older windows platform; not required, dev-FYI only
           # - { os: ubuntu-18.04   , target: i586-unknown-linux-gnu      , features: feat_os_unix           , use-cross: use-cross } ## note: older windows platform; not required, dev-FYI only
           - { os: ubuntu-18.04   , target: i686-unknown-linux-gnu      , features: feat_os_unix           , use-cross: use-cross }
@@ -410,7 +425,7 @@ jobs:
         # tooling info display
         echo "## tooling"
         which gcc >/dev/null 2>&1 && (gcc --version | head -1) || true
-        rustup -V
+        rustup -V 2>/dev/null
         rustup show active-toolchain
         cargo -V
         rustc -V
@@ -418,7 +433,7 @@ jobs:
         # dependencies
         echo "## dependency list"
         cargo fetch --locked --quiet
-        cargo-tree tree --target=${{ matrix.job.target }} ${{ matrix.job.cargo-options }} ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} --all --no-dev-dependencies --no-indent | grep -vE "$PWD" | sort --unique
+        cargo-tree tree --locked --target=${{ matrix.job.target }} ${{ matrix.job.cargo-options }} ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} --all --no-dev-dependencies --no-indent | grep -vE "$PWD" | sort --unique
     - name: Build
       uses: actions-rs/cargo@v1
       with:
@@ -516,6 +531,51 @@ jobs:
         printf "%s\n" "${output}"
         n_fails=$(echo "$output" | grep "^FAIL:\s" | wc --lines)
         if [ $n_fails -gt 0 ] ; then echo "::warning ::${n_fails}+ test failures" ; fi
+
+  test_freebsd:
+    runs-on: macos-latest
+    name: Tests/FreeBSD test suite
+    env:
+      mem: 2048
+    steps:
+    - uses: actions/checkout@v2
+    - name: Prepare, build and test
+      id: test
+      uses: vmactions/freebsd-vm@v0.1.4
+      with:
+        usesh: true
+        prepare: pkg install -y curl gmake sudo
+        run: |
+          # Need to be run in the same block. Otherwise, we are back on the mac host.
+          set -e
+          pw adduser -n cuuser -d /root/ -g wheel -c "Coreutils user to build" -w random
+          chown -R cuuser:wheel /root/ /Users/runner/work/coreutils/
+          whoami
+
+          # Needs to be done in a sudo as we are changing users
+          sudo -i -u cuuser sh << EOF
+          whoami
+          curl https://sh.rustup.rs -sSf --output rustup.sh
+          sh rustup.sh -y --profile=minimal
+          ## Info
+          # environment
+          echo "## environment"
+          echo "CI='${CI}'"
+          # tooling info display
+          echo "## tooling"
+          . $HOME/.cargo/env
+          cargo -V
+          rustc -V
+          env
+
+          # where the files are resynced
+          cd /Users/runner/work/coreutils/coreutils/
+          cargo build
+          cargo test --features feat_os_unix -p uucore -p coreutils
+          # Clean to avoid to rsync back the files
+          cargo clean
+          EOF
+
 
   coverage:
     name: Code Coverage

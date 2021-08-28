@@ -7,7 +7,7 @@
 //  * For the full copyright and license information, please view the LICENSE
 //  * file that was distributed with this source code.
 
-// spell-checker:ignore (ToDO) algo, algoname, regexes, nread
+// spell-checker:ignore (ToDO) algo, algoname, regexes, nread memmem
 
 #[macro_use]
 extern crate clap;
@@ -22,6 +22,7 @@ use self::digest::Digest;
 use clap::{App, Arg, ArgMatches};
 use hex::ToHex;
 use md5::Context as Md5;
+use memchr::memmem;
 use regex::Regex;
 use sha1::Sha1;
 use sha2::{Sha224, Sha256, Sha384, Sha512};
@@ -285,119 +286,7 @@ pub fn uumain(mut args: impl uucore::Args) -> i32 {
     // Default binary in Windows, text mode otherwise
     let binary_flag_default = cfg!(windows);
 
-    let binary_help = format!(
-        "read in binary mode{}",
-        if binary_flag_default {
-            " (default)"
-        } else {
-            ""
-        }
-    );
-
-    let text_help = format!(
-        "read in text mode{}",
-        if binary_flag_default {
-            ""
-        } else {
-            " (default)"
-        }
-    );
-
-    let mut app = App::new(executable!())
-        .version(crate_version!())
-        .about("Compute and check message digests.")
-        .arg(
-            Arg::with_name("binary")
-                .short("b")
-                .long("binary")
-                .help(&binary_help),
-        )
-        .arg(
-            Arg::with_name("check")
-                .short("c")
-                .long("check")
-                .help("read hashsums from the FILEs and check them"),
-        )
-        .arg(
-            Arg::with_name("tag")
-                .long("tag")
-                .help("create a BSD-style checksum"),
-        )
-        .arg(
-            Arg::with_name("text")
-                .short("t")
-                .long("text")
-                .help(&text_help)
-                .conflicts_with("binary"),
-        )
-        .arg(
-            Arg::with_name("quiet")
-                .short("q")
-                .long("quiet")
-                .help("don't print OK for each successfully verified file"),
-        )
-        .arg(
-            Arg::with_name("status")
-                .short("s")
-                .long("status")
-                .help("don't output anything, status code shows success"),
-        )
-        .arg(
-            Arg::with_name("strict")
-                .long("strict")
-                .help("exit non-zero for improperly formatted checksum lines"),
-        )
-        .arg(
-            Arg::with_name("warn")
-                .short("w")
-                .long("warn")
-                .help("warn about improperly formatted checksum lines"),
-        )
-        // Needed for variable-length output sums (e.g. SHAKE)
-        .arg(
-            Arg::with_name("bits")
-                .long("bits")
-                .help("set the size of the output (only for SHAKE)")
-                .takes_value(true)
-                .value_name("BITS")
-                // XXX: should we actually use validators?  they're not particularly efficient
-                .validator(is_valid_bit_num),
-        )
-        .arg(
-            Arg::with_name("FILE")
-                .index(1)
-                .multiple(true)
-                .value_name("FILE"),
-        );
-
-    if !is_custom_binary(&binary_name) {
-        let algorithms = &[
-            ("md5", "work with MD5"),
-            ("sha1", "work with SHA1"),
-            ("sha224", "work with SHA224"),
-            ("sha256", "work with SHA256"),
-            ("sha384", "work with SHA384"),
-            ("sha512", "work with SHA512"),
-            ("sha3", "work with SHA3"),
-            ("sha3-224", "work with SHA3-224"),
-            ("sha3-256", "work with SHA3-256"),
-            ("sha3-384", "work with SHA3-384"),
-            ("sha3-512", "work with SHA3-512"),
-            (
-                "shake128",
-                "work with SHAKE128 using BITS for the output size",
-            ),
-            (
-                "shake256",
-                "work with SHAKE256 using BITS for the output size",
-            ),
-            ("b2sum", "work with BLAKE2"),
-        ];
-
-        for (name, desc) in algorithms {
-            app = app.arg(Arg::with_name(name).long(name).help(desc));
-        }
-    }
+    let app = uu_app(&binary_name);
 
     // FIXME: this should use get_matches_from_safe() and crash!(), but at the moment that just
     //        causes "error: " to be printed twice (once from crash!() and once from clap).  With
@@ -445,6 +334,124 @@ pub fn uumain(mut args: impl uucore::Args) -> i32 {
     }
 }
 
+pub fn uu_app_common() -> App<'static, 'static> {
+    #[cfg(windows)]
+    const BINARY_HELP: &str = "read in binary mode (default)";
+    #[cfg(not(windows))]
+    const BINARY_HELP: &str = "read in binary mode";
+    #[cfg(windows)]
+    const TEXT_HELP: &str = "read in text mode";
+    #[cfg(not(windows))]
+    const TEXT_HELP: &str = "read in text mode (default)";
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about("Compute and check message digests.")
+        .arg(
+            Arg::with_name("binary")
+                .short("b")
+                .long("binary")
+                .help(BINARY_HELP),
+        )
+        .arg(
+            Arg::with_name("check")
+                .short("c")
+                .long("check")
+                .help("read hashsums from the FILEs and check them"),
+        )
+        .arg(
+            Arg::with_name("tag")
+                .long("tag")
+                .help("create a BSD-style checksum"),
+        )
+        .arg(
+            Arg::with_name("text")
+                .short("t")
+                .long("text")
+                .help(TEXT_HELP)
+                .conflicts_with("binary"),
+        )
+        .arg(
+            Arg::with_name("quiet")
+                .short("q")
+                .long("quiet")
+                .help("don't print OK for each successfully verified file"),
+        )
+        .arg(
+            Arg::with_name("status")
+                .short("s")
+                .long("status")
+                .help("don't output anything, status code shows success"),
+        )
+        .arg(
+            Arg::with_name("strict")
+                .long("strict")
+                .help("exit non-zero for improperly formatted checksum lines"),
+        )
+        .arg(
+            Arg::with_name("warn")
+                .short("w")
+                .long("warn")
+                .help("warn about improperly formatted checksum lines"),
+        )
+        // Needed for variable-length output sums (e.g. SHAKE)
+        .arg(
+            Arg::with_name("bits")
+                .long("bits")
+                .help("set the size of the output (only for SHAKE)")
+                .takes_value(true)
+                .value_name("BITS")
+                // XXX: should we actually use validators?  they're not particularly efficient
+                .validator(is_valid_bit_num),
+        )
+        .arg(
+            Arg::with_name("FILE")
+                .index(1)
+                .multiple(true)
+                .value_name("FILE"),
+        )
+}
+
+pub fn uu_app_custom() -> App<'static, 'static> {
+    let mut app = uu_app_common();
+    let algorithms = &[
+        ("md5", "work with MD5"),
+        ("sha1", "work with SHA1"),
+        ("sha224", "work with SHA224"),
+        ("sha256", "work with SHA256"),
+        ("sha384", "work with SHA384"),
+        ("sha512", "work with SHA512"),
+        ("sha3", "work with SHA3"),
+        ("sha3-224", "work with SHA3-224"),
+        ("sha3-256", "work with SHA3-256"),
+        ("sha3-384", "work with SHA3-384"),
+        ("sha3-512", "work with SHA3-512"),
+        (
+            "shake128",
+            "work with SHAKE128 using BITS for the output size",
+        ),
+        (
+            "shake256",
+            "work with SHAKE256 using BITS for the output size",
+        ),
+        ("b2sum", "work with BLAKE2"),
+    ];
+
+    for (name, desc) in algorithms {
+        app = app.arg(Arg::with_name(name).long(name).help(desc));
+    }
+    app
+}
+
+// hashsum is handled differently in build.rs, therefore this is not the same
+// as in other utilities.
+fn uu_app(binary_name: &str) -> App<'static, 'static> {
+    if !is_custom_binary(binary_name) {
+        uu_app_custom()
+    } else {
+        uu_app_common()
+    }
+}
+
 #[allow(clippy::cognitive_complexity)]
 fn hashsum<'a, I>(mut options: Options, files: I) -> Result<(), i32>
 where
@@ -462,25 +469,42 @@ where
             stdin_buf = stdin();
             Box::new(stdin_buf) as Box<dyn Read>
         } else {
-            file_buf = safe_unwrap!(File::open(filename));
+            file_buf = crash_if_err!(1, File::open(filename));
             Box::new(file_buf) as Box<dyn Read>
         });
         if options.check {
             // Set up Regexes for line validation and parsing
+            //
+            // First, we compute the number of bytes we expect to be in
+            // the digest string. If the algorithm has a variable number
+            // of output bits, then we use the `+` modifier in the
+            // regular expression, otherwise we use the `{n}` modifier,
+            // where `n` is the number of bytes.
             let bytes = options.digest.output_bits() / 4;
-            let gnu_re = safe_unwrap!(Regex::new(&format!(
-                r"^(?P<digest>[a-fA-F0-9]{{{}}}) (?P<binary>[ \*])(?P<fileName>.*)",
-                bytes
-            )));
-            let bsd_re = safe_unwrap!(Regex::new(&format!(
-                r"^{algorithm} \((?P<fileName>.*)\) = (?P<digest>[a-fA-F0-9]{{{digest_size}}})",
-                algorithm = options.algoname,
-                digest_size = bytes
-            )));
+            let modifier = if bytes > 0 {
+                format!("{{{}}}", bytes)
+            } else {
+                "+".to_string()
+            };
+            let gnu_re = crash_if_err!(
+                1,
+                Regex::new(&format!(
+                    r"^(?P<digest>[a-fA-F0-9]{}) (?P<binary>[ \*])(?P<fileName>.*)",
+                    modifier,
+                ))
+            );
+            let bsd_re = crash_if_err!(
+                1,
+                Regex::new(&format!(
+                    r"^{algorithm} \((?P<fileName>.*)\) = (?P<digest>[a-fA-F0-9]{digest_size})",
+                    algorithm = options.algoname,
+                    digest_size = modifier,
+                ))
+            );
 
             let buffer = file;
             for (i, line) in buffer.lines().enumerate() {
-                let line = safe_unwrap!(line);
+                let line = crash_if_err!(1, line);
                 let (ck_filename, sum, binary_check) = match gnu_re.captures(&line) {
                     Some(caps) => (
                         caps.name("fileName").unwrap().as_str(),
@@ -510,14 +534,17 @@ where
                         }
                     },
                 };
-                let f = safe_unwrap!(File::open(ck_filename));
+                let f = crash_if_err!(1, File::open(ck_filename));
                 let mut ckf = BufReader::new(Box::new(f) as Box<dyn Read>);
-                let real_sum = safe_unwrap!(digest_reader(
-                    &mut *options.digest,
-                    &mut ckf,
-                    binary_check,
-                    options.output_bits
-                ))
+                let real_sum = crash_if_err!(
+                    1,
+                    digest_reader(
+                        &mut *options.digest,
+                        &mut ckf,
+                        binary_check,
+                        options.output_bits
+                    )
+                )
                 .to_ascii_lowercase();
                 if sum == real_sum {
                     if !options.quiet {
@@ -531,12 +558,15 @@ where
                 }
             }
         } else {
-            let sum = safe_unwrap!(digest_reader(
-                &mut *options.digest,
-                &mut file,
-                options.binary,
-                options.output_bits
-            ));
+            let sum = crash_if_err!(
+                1,
+                digest_reader(
+                    &mut *options.digest,
+                    &mut file,
+                    options.binary,
+                    options.output_bits
+                )
+            );
             if options.tag {
                 println!("{} ({}) = {}", options.algoname, filename.display(), sum);
             } else {
@@ -569,8 +599,6 @@ fn digest_reader<'a, T: Read>(
     // Digest file, do not hold too much in memory at any given moment
     let windows = cfg!(windows);
     let mut buffer = Vec::with_capacity(524_288);
-    let mut vec = Vec::with_capacity(524_288);
-    let mut looking_for_newline = false;
     loop {
         match reader.read_to_end(&mut buffer) {
             Ok(0) => {
@@ -578,34 +606,29 @@ fn digest_reader<'a, T: Read>(
             }
             Ok(nread) => {
                 if windows && !binary {
-                    // Windows text mode returns '\n' when reading '\r\n'
-                    for &b in buffer.iter().take(nread) {
-                        if looking_for_newline {
-                            if b != b'\n' {
-                                vec.push(b'\r');
-                            }
-                            if b != b'\r' {
-                                vec.push(b);
-                                looking_for_newline = false;
-                            }
-                        } else if b != b'\r' {
-                            vec.push(b);
-                        } else {
-                            looking_for_newline = true;
-                        }
+                    // In Windows text mode, replace each occurrence of
+                    // "\r\n" with "\n".
+                    //
+                    // Find all occurrences of "\r\n", inputting the
+                    // slice just before the "\n" in the previous
+                    // instance of "\r\n" and the beginning of this
+                    // "\r\n".
+                    //
+                    // FIXME This fails if one call to `read()` ends
+                    // with the "\r" and the next call to `read()`
+                    // begins with the "\n".
+                    let mut i_prev = 0;
+                    for i in memmem::find_iter(&buffer[0..nread], b"\r\n") {
+                        digest.input(&buffer[i_prev..i]);
+                        i_prev = i + 1;
                     }
-                    digest.input(&vec);
-                    vec.clear();
+                    digest.input(&buffer[i_prev..nread]);
                 } else {
                     digest.input(&buffer[..nread]);
                 }
             }
             Err(e) => return Err(e),
         }
-    }
-    if windows && looking_for_newline {
-        vec.push(b'\r');
-        digest.input(&vec);
     }
 
     if digest.output_bits() > 0 {

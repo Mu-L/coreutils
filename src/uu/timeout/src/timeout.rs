@@ -22,8 +22,11 @@ use uucore::InvalidEncodingHandling;
 
 static ABOUT: &str = "Start COMMAND, and kill it if still running after DURATION.";
 
-fn get_usage() -> String {
-    format!("{0} [OPTION] DURATION COMMAND...", executable!())
+fn usage() -> String {
+    format!(
+        "{0} [OPTION] DURATION COMMAND...",
+        uucore::execution_phrase()
+    )
 }
 
 const ERR_EXIT_STATUS: i32 = 125;
@@ -89,8 +92,8 @@ impl Config {
             signal,
             duration,
             preserve_status,
-            command,
             verbose,
+            command,
         }
     }
 }
@@ -100,11 +103,27 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
-    let usage = get_usage();
+    let usage = usage();
 
-    let app = App::new("timeout")
+    let app = uu_app().usage(&usage[..]);
+
+    let matches = app.get_matches_from(args);
+
+    let config = Config::from(matches);
+    timeout(
+        &config.command,
+        config.duration,
+        config.signal,
+        config.kill_after,
+        config.foreground,
+        config.preserve_status,
+        config.verbose,
+    )
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new("timeout")
         .version(crate_version!())
-        .usage(&usage[..])
         .about(ABOUT)
         .arg(
             Arg::with_name(options::FOREGROUND)
@@ -144,20 +163,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .required(true)
                 .multiple(true)
         )
-        .setting(AppSettings::TrailingVarArg);
-
-    let matches = app.get_matches_from(args);
-
-    let config = Config::from(matches);
-    timeout(
-        &config.command,
-        config.duration,
-        config.signal,
-        config.kill_after,
-        config.foreground,
-        config.preserve_status,
-        config.verbose,
-    )
+        .setting(AppSettings::TrailingVarArg)
 }
 
 /// Remove pre-existing SIGCHLD handlers that would make waiting for the child's exit code fail.
@@ -215,7 +221,7 @@ fn timeout(
                     cmd[0]
                 );
             }
-            return_if_err!(ERR_EXIT_STATUS, process.send_signal(signal));
+            crash_if_err!(ERR_EXIT_STATUS, process.send_signal(signal));
             if let Some(kill_after) = kill_after {
                 match process.wait_or_timeout(kill_after) {
                     Ok(Some(status)) => {
@@ -229,13 +235,13 @@ fn timeout(
                         if verbose {
                             show_error!("sending signal KILL to command '{}'", cmd[0]);
                         }
-                        return_if_err!(
+                        crash_if_err!(
                             ERR_EXIT_STATUS,
                             process.send_signal(
                                 uucore::signals::signal_by_name_or_value("KILL").unwrap()
                             )
                         );
-                        return_if_err!(ERR_EXIT_STATUS, process.wait());
+                        crash_if_err!(ERR_EXIT_STATUS, process.wait());
                         137
                     }
                     Err(_) => 124,
@@ -245,7 +251,7 @@ fn timeout(
             }
         }
         Err(_) => {
-            return_if_err!(ERR_EXIT_STATUS, process.send_signal(signal));
+            crash_if_err!(ERR_EXIT_STATUS, process.send_signal(signal));
             ERR_EXIT_STATUS
         }
     }

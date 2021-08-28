@@ -25,7 +25,6 @@ enum Mode {
     Both,    // a combination of `Basic` and `Extra`
 }
 
-static NAME: &str = "pathchk";
 static ABOUT: &str = "Check whether file names are valid or portable";
 
 mod options {
@@ -39,37 +38,17 @@ mod options {
 const POSIX_PATH_MAX: usize = 256;
 const POSIX_NAME_MAX: usize = 14;
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... NAME...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... NAME...", uucore::execution_phrase())
 }
 
 pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+    let usage = usage();
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::POSIX)
-                .short("p")
-                .help("check for most POSIX systems"),
-        )
-        .arg(
-            Arg::with_name(options::POSIX_SPECIAL)
-                .short("P")
-                .help(r#"check for empty names and leading "-""#),
-        )
-        .arg(
-            Arg::with_name(options::PORTABILITY)
-                .long(options::PORTABILITY)
-                .help("check for all POSIX systems (equivalent to -p -P)"),
-        )
-        .arg(Arg::with_name(options::PATH).hidden(true).multiple(true))
-        .get_matches_from(args);
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
 
     // set working mode
     let is_posix = matches.values_of(options::POSIX).is_some();
@@ -89,7 +68,10 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     // take necessary actions
     let paths = matches.values_of(options::PATH);
     let mut res = if paths.is_none() {
-        show_error!("missing operand\nTry {} --help for more information", NAME);
+        show_error!(
+            "missing operand\nTry '{} --help' for more information",
+            uucore::execution_phrase()
+        );
         false
     } else {
         true
@@ -113,6 +95,28 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     } else {
         1
     }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .arg(
+            Arg::with_name(options::POSIX)
+                .short("p")
+                .help("check for most POSIX systems"),
+        )
+        .arg(
+            Arg::with_name(options::POSIX_SPECIAL)
+                .short("P")
+                .help(r#"check for empty names and leading "-""#),
+        )
+        .arg(
+            Arg::with_name(options::PORTABILITY)
+                .long(options::PORTABILITY)
+                .help("check for all POSIX systems (equivalent to -p -P)"),
+        )
+        .arg(Arg::with_name(options::PATH).hidden(true).multiple(true))
 }
 
 // check a path, given as a slice of it's components and an operating mode
@@ -168,7 +172,7 @@ fn check_basic(path: &[String]) -> bool {
 fn check_extra(path: &[String]) -> bool {
     // components: leading hyphens
     for p in path {
-        if !no_leading_hyphen(p) {
+        if p.starts_with('-') {
             writeln!(
                 &mut std::io::stderr(),
                 "leading hyphen in file name component '{}'",
@@ -232,11 +236,6 @@ fn check_searchable(path: &str) -> bool {
             }
         }
     }
-}
-
-// check for a hyphen at the beginning of a path segment
-fn no_leading_hyphen(path_segment: &str) -> bool {
-    !path_segment.starts_with('-')
 }
 
 // check whether a path segment contains only valid (read: portable) characters

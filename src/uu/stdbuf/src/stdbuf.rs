@@ -47,8 +47,8 @@ mod options {
     pub const COMMAND: &str = "command";
 }
 
-fn get_usage() -> String {
-    format!("{0} OPTION... COMMAND", executable!())
+fn usage() -> String {
+    format!("{0} OPTION... COMMAND", uucore::execution_phrase())
 }
 
 const STDBUF_INJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libstdbuf.so"));
@@ -152,12 +152,48 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
-    let usage = get_usage();
+    let usage = usage();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+
+    let options = ProgramOptions::try_from(&matches).unwrap_or_else(|e| {
+        crash!(
+            125,
+            "{}\nTry '{} --help' for more information.",
+            e.0,
+            uucore::execution_phrase()
+        )
+    });
+
+    let mut command_values = matches.values_of::<&str>(options::COMMAND).unwrap();
+    let mut command = Command::new(command_values.next().unwrap());
+    let command_params: Vec<&str> = command_values.collect();
+
+    let mut tmp_dir = tempdir().unwrap();
+    let (preload_env, libstdbuf) = crash_if_err!(1, get_preload_env(&mut tmp_dir));
+    command.env(preload_env, libstdbuf);
+    set_command_env(&mut command, "_STDBUF_I", options.stdin);
+    set_command_env(&mut command, "_STDBUF_O", options.stdout);
+    set_command_env(&mut command, "_STDBUF_E", options.stderr);
+    command.args(command_params);
+
+    let mut process = match command.spawn() {
+        Ok(p) => p,
+        Err(e) => crash!(1, "failed to execute process: {}", e),
+    };
+    match process.wait() {
+        Ok(status) => match status.code() {
+            Some(i) => i,
+            None => crash!(1, "process killed by signal {}", status.signal().unwrap()),
+        },
+        Err(e) => crash!(1, "{}", e),
+    }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
         .after_help(LONG_HELP)
         .setting(AppSettings::TrailingVarArg)
         .arg(
@@ -191,32 +227,4 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .hidden(true)
                 .required(true),
         )
-        .get_matches_from(args);
-
-    let options = ProgramOptions::try_from(&matches)
-        .unwrap_or_else(|e| crash!(125, "{}\nTry 'stdbuf --help' for more information.", e.0));
-
-    let mut command_values = matches.values_of::<&str>(options::COMMAND).unwrap();
-    let mut command = Command::new(command_values.next().unwrap());
-    let command_params: Vec<&str> = command_values.collect();
-
-    let mut tmp_dir = tempdir().unwrap();
-    let (preload_env, libstdbuf) = return_if_err!(1, get_preload_env(&mut tmp_dir));
-    command.env(preload_env, libstdbuf);
-    set_command_env(&mut command, "_STDBUF_I", options.stdin);
-    set_command_env(&mut command, "_STDBUF_O", options.stdout);
-    set_command_env(&mut command, "_STDBUF_E", options.stderr);
-    command.args(command_params);
-
-    let mut process = match command.spawn() {
-        Ok(p) => p,
-        Err(e) => crash!(1, "failed to execute process: {}", e),
-    };
-    match process.wait() {
-        Ok(status) => match status.code() {
-            Some(i) => i,
-            None => crash!(1, "process killed by signal {}", status.signal().unwrap()),
-        },
-        Err(e) => crash!(1, "{}", e),
-    }
 }

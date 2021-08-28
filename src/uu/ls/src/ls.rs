@@ -14,7 +14,6 @@ extern crate uucore;
 extern crate lazy_static;
 
 mod quoting_style;
-mod version_cmp;
 
 use clap::{crate_version, App, Arg};
 use globset::{self, Glob, GlobSet, GlobSetBuilder};
@@ -26,10 +25,11 @@ use quoting_style::{escape_name, QuotingStyle};
 use std::os::windows::fs::MetadataExt;
 use std::{
     cmp::Reverse,
+    error::Error,
+    fmt::Display,
     fs::{self, DirEntry, FileType, Metadata},
     io::{stdout, BufWriter, Stdout, Write},
     path::{Path, PathBuf},
-    process::exit,
     time::{SystemTime, UNIX_EPOCH},
 };
 #[cfg(unix)]
@@ -38,26 +38,20 @@ use std::{
     os::unix::fs::{FileTypeExt, MetadataExt},
     time::Duration,
 };
-
 use term_grid::{Cell, Direction, Filling, Grid, GridOptions};
+use uucore::error::{set_exit_code, FromIo, UError, UResult};
 
 use unicode_width::UnicodeWidthStr;
 #[cfg(unix)]
 use uucore::libc::{S_IXGRP, S_IXOTH, S_IXUSR};
+use uucore::{fs::display_permissions, version_cmp::version_cmp};
 
-static ABOUT: &str = "
- By default, ls will list the files and contents of any directories on
- the command line, expect that it will ignore files and directories
- whose names start with '.'
-";
-static AFTER_HELP: &str = "The TIME_STYLE argument can be full-iso, long-iso, iso.
-Also the TIME_STYLE environment variable sets the default style to use.";
-
-fn get_usage() -> String {
-    format!("{0} [OPTION]... [FILE]...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... [FILE]...", uucore::execution_phrase())
 }
 
 pub mod options {
+
     pub mod format {
         pub static ONE_LINE: &str = "1";
         pub static LONG: &str = "long";
@@ -68,10 +62,12 @@ pub mod options {
         pub static LONG_NO_GROUP: &str = "o";
         pub static LONG_NUMERIC_UID_GID: &str = "numeric-uid-gid";
     }
+
     pub mod files {
         pub static ALL: &str = "all";
         pub static ALMOST_ALL: &str = "almost-all";
     }
+
     pub mod sort {
         pub static SIZE: &str = "S";
         pub static TIME: &str = "t";
@@ -79,30 +75,36 @@ pub mod options {
         pub static VERSION: &str = "v";
         pub static EXTENSION: &str = "X";
     }
+
     pub mod time {
         pub static ACCESS: &str = "u";
         pub static CHANGE: &str = "c";
     }
+
     pub mod size {
         pub static HUMAN_READABLE: &str = "human-readable";
         pub static SI: &str = "si";
     }
+
     pub mod quoting {
         pub static ESCAPE: &str = "escape";
         pub static LITERAL: &str = "literal";
         pub static C: &str = "quote-name";
     }
-    pub static QUOTING_STYLE: &str = "quoting-style";
+
     pub mod indicator_style {
         pub static SLASH: &str = "p";
         pub static FILE_TYPE: &str = "file-type";
         pub static CLASSIFY: &str = "classify";
     }
+
     pub mod dereference {
         pub static ALL: &str = "dereference";
         pub static ARGS: &str = "dereference-command-line";
         pub static DIR_ARGS: &str = "dereference-command-line-symlink-to-dir";
     }
+
+    pub static QUOTING_STYLE: &str = "quoting-style";
     pub static HIDE_CONTROL_CHARS: &str = "hide-control-chars";
     pub static SHOW_CONTROL_CHARS: &str = "show-control-chars";
     pub static WIDTH: &str = "width";
@@ -123,6 +125,34 @@ pub mod options {
     pub static FULL_TIME: &str = "full-time";
     pub static HIDE: &str = "hide";
     pub static IGNORE: &str = "ignore";
+}
+
+const DEFAULT_TERM_WIDTH: u16 = 80;
+
+#[derive(Debug)]
+enum LsError {
+    InvalidLineWidth(String),
+    NoMetadata(PathBuf),
+}
+
+impl UError for LsError {
+    fn code(&self) -> i32 {
+        match self {
+            LsError::InvalidLineWidth(_) => 2,
+            LsError::NoMetadata(_) => 1,
+        }
+    }
+}
+
+impl Error for LsError {}
+
+impl Display for LsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LsError::InvalidLineWidth(s) => write!(f, "invalid line width: '{}'", s),
+            LsError::NoMetadata(p) => write!(f, "could not open file: '{}'", p.display()),
+        }
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -201,7 +231,7 @@ struct Config {
     inode: bool,
     color: Option<LsColors>,
     long: LongFormat,
-    width: Option<u16>,
+    width: u16,
     quoting_style: QuotingStyle,
     indicator_style: IndicatorStyle,
     time_style: TimeStyle,
@@ -218,7 +248,7 @@ struct LongFormat {
 
 impl Config {
     #[allow(clippy::cognitive_complexity)]
-    fn from(options: clap::ArgMatches) -> Config {
+    fn from(options: clap::ArgMatches) -> UResult<Config> {
         let (mut format, opt) = if let Some(format_) = options.value_of(options::FORMAT) {
             (
                 match format_ {
@@ -230,16 +260,20 @@ impl Config {
                     // below should never happen as clap already restricts the values.
                     _ => unreachable!("Invalid field for --format"),
                 },
-                options::FORMAT,
+                Some(options::FORMAT),
             )
         } else if options.is_present(options::format::LONG) {
-            (Format::Long, options::format::LONG)
+            (Format::Long, Some(options::format::LONG))
         } else if options.is_present(options::format::ACROSS) {
-            (Format::Across, options::format::ACROSS)
+            (Format::Across, Some(options::format::ACROSS))
         } else if options.is_present(options::format::COMMAS) {
-            (Format::Commas, options::format::COMMAS)
+            (Format::Commas, Some(options::format::COMMAS))
+        } else if options.is_present(options::format::COLUMNS) {
+            (Format::Columns, Some(options::format::COLUMNS))
+        } else if atty::is(atty::Stream::Stdout) {
+            (Format::Columns, None)
         } else {
-            (Format::Columns, options::format::COLUMNS)
+            (Format::OneLine, None)
         };
 
         // The -o, -n and -g options are tricky. They cannot override with each
@@ -258,9 +292,8 @@ impl Config {
         // options, but manually whether they have an index that's greater than
         // the other format options. If so, we set the appropriate format.
         if format != Format::Long {
-            let idx = options
-                .indices_of(opt)
-                .map(|x| x.max().unwrap())
+            let idx = opt
+                .and_then(|opt| options.indices_of(opt).map(|x| x.max().unwrap()))
                 .unwrap_or(0);
             if [
                 options::format::LONG_NO_OWNER,
@@ -369,15 +402,28 @@ impl Config {
             }
         };
 
-        let width = options
-            .value_of(options::WIDTH)
-            .map(|x| {
-                x.parse::<u16>().unwrap_or_else(|_e| {
-                    show_error!("invalid line width: ‘{}’", x);
-                    exit(2);
-                })
-            })
-            .or_else(|| termsize::get().map(|s| s.cols));
+        let width = match options.value_of(options::WIDTH) {
+            Some(x) => match x.parse::<u16>() {
+                Ok(u) => u,
+                Err(_) => return Err(LsError::InvalidLineWidth(x.into()).into()),
+            },
+            None => match termsize::get() {
+                Some(size) => size.cols,
+                None => match std::env::var("COLUMNS") {
+                    Ok(columns) => match columns.parse() {
+                        Ok(columns) => columns,
+                        Err(_) => {
+                            show_error!(
+                                "ignoring invalid width in environment variable COLUMNS: '{}'",
+                                columns
+                            );
+                            DEFAULT_TERM_WIDTH
+                        }
+                    },
+                    Err(_) => DEFAULT_TERM_WIDTH,
+                },
+            },
+        };
 
         #[allow(clippy::needless_bool)]
         let show_control = if options.is_present(options::HIDE_CONTROL_CHARS) {
@@ -528,7 +574,7 @@ impl Config {
             Dereference::DirArgs
         };
 
-        Config {
+        Ok(Config {
             format,
             files,
             sort,
@@ -547,29 +593,54 @@ impl Config {
             quoting_style,
             indicator_style,
             time_style,
-        }
+        })
     }
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let usage = get_usage();
+    let usage = usage();
 
-    let app = App::new(executable!())
+    let app = uu_app().usage(&usage[..]);
+
+    let matches = app.get_matches_from(args);
+
+    let locs = matches
+        .values_of(options::PATHS)
+        .map(|v| v.map(ToString::to_string).collect())
+        .unwrap_or_else(|| vec![String::from(".")]);
+
+    list(locs, Config::from(matches)?)
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
-        .about(ABOUT)
-        .usage(&usage[..])
-
+        .about(
+            "By default, ls will list the files and contents of any directories on \
+            the command line, expect that it will ignore files and directories \
+            whose names start with '.'.",
+        )
         // Format arguments
         .arg(
             Arg::with_name(options::FORMAT)
                 .long(options::FORMAT)
                 .help("Set the display format.")
                 .takes_value(true)
-                .possible_values(&["long", "verbose", "single-column", "columns", "vertical", "across", "horizontal", "commas"])
+                .possible_values(&[
+                    "long",
+                    "verbose",
+                    "single-column",
+                    "columns",
+                    "vertical",
+                    "across",
+                    "horizontal",
+                    "commas",
+                ])
                 .hide_possible_values(true)
                 .require_equals(true)
                 .overrides_with_all(&[
@@ -639,41 +710,51 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             Arg::with_name(options::format::ONE_LINE)
                 .short(options::format::ONE_LINE)
                 .help("List one file per line.")
-                .multiple(true)
+                .multiple(true),
         )
         .arg(
             Arg::with_name(options::format::LONG_NO_GROUP)
                 .short(options::format::LONG_NO_GROUP)
-                .help("Long format without group information. Identical to --format=long with --no-group.")
-                .multiple(true)
+                .help(
+                    "Long format without group information. \
+                    Identical to --format=long with --no-group.",
+                )
+                .multiple(true),
         )
         .arg(
             Arg::with_name(options::format::LONG_NO_OWNER)
                 .short(options::format::LONG_NO_OWNER)
                 .help("Long format without owner information.")
-                .multiple(true)
+                .multiple(true),
         )
         .arg(
             Arg::with_name(options::format::LONG_NUMERIC_UID_GID)
                 .short("n")
                 .long(options::format::LONG_NUMERIC_UID_GID)
                 .help("-l with numeric UIDs and GIDs.")
-                .multiple(true)
+                .multiple(true),
         )
-
         // Quoting style
         .arg(
             Arg::with_name(options::QUOTING_STYLE)
                 .long(options::QUOTING_STYLE)
                 .takes_value(true)
                 .help("Set quoting style.")
-                .possible_values(&["literal", "shell", "shell-always", "shell-escape", "shell-escape-always", "c", "escape"])
+                .possible_values(&[
+                    "literal",
+                    "shell",
+                    "shell-always",
+                    "shell-escape",
+                    "shell-escape-always",
+                    "c",
+                    "escape",
+                ])
                 .overrides_with_all(&[
                     options::QUOTING_STYLE,
                     options::quoting::LITERAL,
                     options::quoting::ESCAPE,
                     options::quoting::C,
-                ])
+                ]),
         )
         .arg(
             Arg::with_name(options::quoting::LITERAL)
@@ -685,7 +766,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::quoting::LITERAL,
                     options::quoting::ESCAPE,
                     options::quoting::C,
-                ])
+                ]),
         )
         .arg(
             Arg::with_name(options::quoting::ESCAPE)
@@ -697,7 +778,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::quoting::LITERAL,
                     options::quoting::ESCAPE,
                     options::quoting::C,
-                ])
+                ]),
         )
         .arg(
             Arg::with_name(options::quoting::C)
@@ -709,76 +790,63 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::quoting::LITERAL,
                     options::quoting::ESCAPE,
                     options::quoting::C,
-                ])
+                ]),
         )
-
         // Control characters
         .arg(
             Arg::with_name(options::HIDE_CONTROL_CHARS)
                 .short("q")
                 .long(options::HIDE_CONTROL_CHARS)
                 .help("Replace control characters with '?' if they are not escaped.")
-                .overrides_with_all(&[
-                    options::HIDE_CONTROL_CHARS,
-                    options::SHOW_CONTROL_CHARS,
-                ])
+                .overrides_with_all(&[options::HIDE_CONTROL_CHARS, options::SHOW_CONTROL_CHARS]),
         )
         .arg(
             Arg::with_name(options::SHOW_CONTROL_CHARS)
                 .long(options::SHOW_CONTROL_CHARS)
                 .help("Show control characters 'as is' if they are not escaped.")
-                .overrides_with_all(&[
-                    options::HIDE_CONTROL_CHARS,
-                    options::SHOW_CONTROL_CHARS,
-                ])
+                .overrides_with_all(&[options::HIDE_CONTROL_CHARS, options::SHOW_CONTROL_CHARS]),
         )
-
         // Time arguments
         .arg(
             Arg::with_name(options::TIME)
                 .long(options::TIME)
-                .help("Show time in <field>:\n\
+                .help(
+                    "Show time in <field>:\n\
                     \taccess time (-u): atime, access, use;\n\
                     \tchange time (-t): ctime, status.\n\
-                    \tbirth time: birth, creation;")
+                    \tbirth time: birth, creation;",
+                )
                 .value_name("field")
                 .takes_value(true)
-                .possible_values(&["atime", "access", "use", "ctime", "status", "birth", "creation"])
+                .possible_values(&[
+                    "atime", "access", "use", "ctime", "status", "birth", "creation",
+                ])
                 .hide_possible_values(true)
                 .require_equals(true)
-                .overrides_with_all(&[
-                    options::TIME,
-                    options::time::ACCESS,
-                    options::time::CHANGE,
-                ])
+                .overrides_with_all(&[options::TIME, options::time::ACCESS, options::time::CHANGE]),
         )
         .arg(
             Arg::with_name(options::time::CHANGE)
                 .short(options::time::CHANGE)
-                .help("If the long listing format (e.g., -l, -o) is being used, print the status \
-                change time (the ‘ctime’ in the inode) instead of the modification time. When \
+                .help(
+                    "If the long listing format (e.g., -l, -o) is being used, print the status \
+                change time (the 'ctime' in the inode) instead of the modification time. When \
                 explicitly sorting by time (--sort=time or -t) or when not using a long listing \
-                format, sort according to the status change time.")
-                .overrides_with_all(&[
-                    options::TIME,
-                    options::time::ACCESS,
-                    options::time::CHANGE,
-                ])
+                format, sort according to the status change time.",
+                )
+                .overrides_with_all(&[options::TIME, options::time::ACCESS, options::time::CHANGE]),
         )
         .arg(
             Arg::with_name(options::time::ACCESS)
                 .short(options::time::ACCESS)
-                .help("If the long listing format (e.g., -l, -o) is being used, print the status \
+                .help(
+                    "If the long listing format (e.g., -l, -o) is being used, print the status \
                 access time instead of the modification time. When explicitly sorting by time \
                 (--sort=time or -t) or when not using a long listing format, sort according to the \
-                access time.")
-                .overrides_with_all(&[
-                    options::TIME,
-                    options::time::ACCESS,
-                    options::time::CHANGE,
-                ])
+                access time.",
+                )
+                .overrides_with_all(&[options::TIME, options::time::ACCESS, options::time::CHANGE]),
         )
-
         // Hide and ignore
         .arg(
             Arg::with_name(options::HIDE)
@@ -786,7 +854,9 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .takes_value(true)
                 .multiple(true)
                 .value_name("PATTERN")
-                .help("do not list implied entries matching shell PATTERN (overridden by -a or -A)")
+                .help(
+                    "do not list implied entries matching shell PATTERN (overridden by -a or -A)",
+                ),
         )
         .arg(
             Arg::with_name(options::IGNORE)
@@ -795,7 +865,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .takes_value(true)
                 .multiple(true)
                 .value_name("PATTERN")
-                .help("do not list implied entries matching shell PATTERN")
+                .help("do not list implied entries matching shell PATTERN"),
         )
         .arg(
             Arg::with_name(options::IGNORE_BACKUPS)
@@ -803,7 +873,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .long(options::IGNORE_BACKUPS)
                 .help("Ignore entries which end with ~."),
         )
-
         // Sort arguments
         .arg(
             Arg::with_name(options::SORT)
@@ -820,7 +889,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::sort::NONE,
                     options::sort::VERSION,
                     options::sort::EXTENSION,
-                ])
+                ]),
         )
         .arg(
             Arg::with_name(options::sort::SIZE)
@@ -833,7 +902,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::sort::NONE,
                     options::sort::VERSION,
                     options::sort::EXTENSION,
-                ])
+                ]),
         )
         .arg(
             Arg::with_name(options::sort::TIME)
@@ -846,7 +915,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::sort::NONE,
                     options::sort::VERSION,
                     options::sort::EXTENSION,
-                ])
+                ]),
         )
         .arg(
             Arg::with_name(options::sort::VERSION)
@@ -859,7 +928,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::sort::NONE,
                     options::sort::VERSION,
                     options::sort::EXTENSION,
-                ])
+                ]),
         )
         .arg(
             Arg::with_name(options::sort::EXTENSION)
@@ -872,14 +941,16 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::sort::NONE,
                     options::sort::VERSION,
                     options::sort::EXTENSION,
-                ])
+                ]),
         )
         .arg(
             Arg::with_name(options::sort::NONE)
                 .short(options::sort::NONE)
-                .help("Do not sort; list the files in whatever order they are stored in the \
-                directory.  This is especially useful when listing very large directories, \
-                since not doing any sorting can be noticeably faster.")
+                .help(
+                    "Do not sort; list the files in whatever order they are stored in the \
+    directory.  This is especially useful when listing very large directories, \
+    since not doing any sorting can be noticeably faster.",
+                )
                 .overrides_with_all(&[
                     options::SORT,
                     options::sort::SIZE,
@@ -887,9 +958,8 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::sort::NONE,
                     options::sort::VERSION,
                     options::sort::EXTENSION,
-                ])
+                ]),
         )
-
         // Dereferencing
         .arg(
             Arg::with_name(options::dereference::ALL)
@@ -903,48 +973,43 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::dereference::ALL,
                     options::dereference::DIR_ARGS,
                     options::dereference::ARGS,
-                ])
+                ]),
         )
         .arg(
             Arg::with_name(options::dereference::DIR_ARGS)
                 .long(options::dereference::DIR_ARGS)
                 .help(
                     "Do not dereference symlinks except when they link to directories and are \
-                    given as command line arguments.",
+                given as command line arguments.",
                 )
                 .overrides_with_all(&[
                     options::dereference::ALL,
                     options::dereference::DIR_ARGS,
                     options::dereference::ARGS,
-                ])
+                ]),
         )
         .arg(
             Arg::with_name(options::dereference::ARGS)
                 .short("H")
                 .long(options::dereference::ARGS)
-                .help(
-                    "Do not dereference symlinks except when given as command line arguments.",
-                )
+                .help("Do not dereference symlinks except when given as command line arguments.")
                 .overrides_with_all(&[
                     options::dereference::ALL,
                     options::dereference::DIR_ARGS,
                     options::dereference::ARGS,
-                ])
+                ]),
         )
-
         // Long format options
         .arg(
             Arg::with_name(options::NO_GROUP)
                 .long(options::NO_GROUP)
                 .short("-G")
-                .help("Do not show group in long format.")
+                .help("Do not show group in long format."),
         )
-        .arg(
-            Arg::with_name(options::AUTHOR)
-                .long(options::AUTHOR)
-                .help("Show author in long format. On the supported platforms, the author \
-                always matches the file owner.")
-        )
+        .arg(Arg::with_name(options::AUTHOR).long(options::AUTHOR).help(
+            "Show author in long format. \
+            On the supported platforms, the author always matches the file owner.",
+        ))
         // Other Flags
         .arg(
             Arg::with_name(options::files::ALL)
@@ -957,9 +1022,9 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .short("A")
                 .long(options::files::ALMOST_ALL)
                 .help(
-                "In a directory, do not ignore all file names that start with '.', only ignore \
-                '.' and '..'.",
-            ),
+                    "In a directory, do not ignore all file names that start with '.', \
+only ignore '.' and '..'.",
+                ),
         )
         .arg(
             Arg::with_name(options::DIRECTORY)
@@ -982,7 +1047,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         .arg(
             Arg::with_name(options::size::SI)
                 .long(options::size::SI)
-                .help("Print human readable file sizes using powers of 1000 instead of 1024.")
+                .help("Print human readable file sizes using powers of 1000 instead of 1024."),
         )
         .arg(
             Arg::with_name(options::INODE)
@@ -994,9 +1059,11 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             Arg::with_name(options::REVERSE)
                 .short("r")
                 .long(options::REVERSE)
-                .help("Reverse whatever the sorting method is--e.g., list files in reverse \
+                .help(
+                    "Reverse whatever the sorting method is e.g., list files in reverse \
                 alphabetical order, youngest first, smallest first, or whatever.",
-        ))
+                ),
+        )
         .arg(
             Arg::with_name(options::RECURSIVE)
                 .short("R")
@@ -1009,7 +1076,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .short("w")
                 .help("Assume that the terminal is COLS columns wide.")
                 .value_name("COLS")
-                .takes_value(true)
+                .takes_value(true),
         )
         .arg(
             Arg::with_name(options::COLOR)
@@ -1022,8 +1089,10 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         .arg(
             Arg::with_name(options::INDICATOR_STYLE)
                 .long(options::INDICATOR_STYLE)
-                .help(" append indicator with style WORD to entry names: none (default),  slash\
-                       (-p), file-type (--file-type), classify (-F)")
+                .help(
+                    "Append indicator with style WORD to entry names: \
+                    none (default),  slash (-p), file-type (--file-type), classify (-F)",
+                )
                 .takes_value(true)
                 .possible_values(&["none", "slash", "file-type", "classify"])
                 .overrides_with_all(&[
@@ -1031,21 +1100,24 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::indicator_style::SLASH,
                     options::indicator_style::CLASSIFY,
                     options::INDICATOR_STYLE,
-                ]))
-                .arg(
+                ]),
+        )
+        .arg(
             Arg::with_name(options::indicator_style::CLASSIFY)
                 .short("F")
                 .long(options::indicator_style::CLASSIFY)
-                .help("Append a character to each file name indicating the file type. Also, for \
-                       regular files that are executable, append '*'. The file type indicators are \
-                       '/' for directories, '@' for symbolic links, '|' for FIFOs, '=' for sockets, \
-                       '>' for doors, and nothing for regular files.")
+                .help(
+                    "Append a character to each file name indicating the file type. Also, for \
+                regular files that are executable, append '*'. The file type indicators are \
+                '/' for directories, '@' for symbolic links, '|' for FIFOs, '=' for sockets, \
+                '>' for doors, and nothing for regular files.",
+                )
                 .overrides_with_all(&[
                     options::indicator_style::FILE_TYPE,
                     options::indicator_style::SLASH,
                     options::indicator_style::CLASSIFY,
                     options::INDICATOR_STYLE,
-                ])
+                ]),
         )
         .arg(
             Arg::with_name(options::indicator_style::FILE_TYPE)
@@ -1056,18 +1128,19 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::indicator_style::SLASH,
                     options::indicator_style::CLASSIFY,
                     options::INDICATOR_STYLE,
-                ]))
+                ]),
+        )
         .arg(
             Arg::with_name(options::indicator_style::SLASH)
                 .short(options::indicator_style::SLASH)
-                .help("Append / indicator to directories."
-                )
+                .help("Append / indicator to directories.")
                 .overrides_with_all(&[
                     options::indicator_style::FILE_TYPE,
                     options::indicator_style::SLASH,
                     options::indicator_style::CLASSIFY,
                     options::INDICATOR_STYLE,
-                ]))
+                ]),
+        )
         .arg(
             //This still needs support for posix-*, +FORMAT
             Arg::with_name(options::TIME_STYLE)
@@ -1075,36 +1148,25 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .help("time/date format with -l; see TIME_STYLE below")
                 .value_name("TIME_STYLE")
                 .env("TIME_STYLE")
-                .possible_values(&[
-                    "full-iso",
-                    "long-iso",
-                    "iso",
-                    "locale",
-                ])
-                .overrides_with_all(&[
-                    options::TIME_STYLE
-                ])
+                .possible_values(&["full-iso", "long-iso", "iso", "locale"])
+                .overrides_with_all(&[options::TIME_STYLE]),
         )
         .arg(
             Arg::with_name(options::FULL_TIME)
-            .long(options::FULL_TIME)
-            .overrides_with(options::FULL_TIME)
-            .help("like -l --time-style=full-iso")
+                .long(options::FULL_TIME)
+                .overrides_with(options::FULL_TIME)
+                .help("like -l --time-style=full-iso"),
         )
-
-    // Positional arguments
-        .arg(Arg::with_name(options::PATHS).multiple(true).takes_value(true))
-
-        .after_help(AFTER_HELP);
-
-    let matches = app.get_matches_from(args);
-
-    let locs = matches
-        .values_of(options::PATHS)
-        .map(|v| v.map(ToString::to_string).collect())
-        .unwrap_or_else(|| vec![String::from(".")]);
-
-    list(locs, Config::from(matches))
+        // Positional arguments
+        .arg(
+            Arg::with_name(options::PATHS)
+                .multiple(true)
+                .takes_value(true),
+        )
+        .after_help(
+            "The TIME_STYLE argument can be full-iso, long-iso, iso. \
+            Also the TIME_STYLE environment variable sets the default style to use.",
+        )
 }
 
 /// Represents a Path along with it's associated data
@@ -1187,31 +1249,27 @@ impl PathData {
     }
 }
 
-fn list(locs: Vec<String>, config: Config) -> i32 {
+fn list(locs: Vec<String>, config: Config) -> UResult<()> {
     let mut files = Vec::<PathData>::new();
     let mut dirs = Vec::<PathData>::new();
-    let mut has_failed = false;
 
     let mut out = BufWriter::new(stdout());
 
     for loc in &locs {
         let p = PathBuf::from(&loc);
-        if !p.exists() {
-            show_error!("'{}': {}", &loc, "No such file or directory");
-            /*
-            We found an error, the return code of ls should not be 0
-            And no need to continue the execution
-            */
-            has_failed = true;
+        let path_data = PathData::new(p, None, None, &config, true);
+
+        if path_data.md().is_none() {
+            show!(std::io::ErrorKind::NotFound
+                .map_err_context(|| format!("cannot access '{}'", path_data.p_buf.display())));
+            // We found an error, no need to continue the execution
             continue;
         }
-
-        let path_data = PathData::new(p, None, None, &config, true);
 
         let show_dir_contents = match path_data.file_type() {
             Some(ft) => !config.directory && ft.is_dir(),
             None => {
-                has_failed = true;
+                set_exit_code(1);
                 false
             }
         };
@@ -1232,11 +1290,8 @@ fn list(locs: Vec<String>, config: Config) -> i32 {
         }
         enter_directory(&dir, &config, &mut out);
     }
-    if has_failed {
-        1
-    } else {
-        0
-    }
+
+    Ok(())
 }
 
 fn sort_entries(entries: &mut Vec<PathData>, config: &Config) {
@@ -1253,7 +1308,8 @@ fn sort_entries(entries: &mut Vec<PathData>, config: &Config) {
         }
         // The default sort in GNU ls is case insensitive
         Sort::Name => entries.sort_by(|a, b| a.display_name.cmp(&b.display_name)),
-        Sort::Version => entries.sort_by(|a, b| version_cmp::version_cmp(&a.p_buf, &b.p_buf)),
+        Sort::Version => entries
+            .sort_by(|a, b| version_cmp(&a.p_buf.to_string_lossy(), &b.p_buf.to_string_lossy())),
         Sort::Extension => entries.sort_by(|a, b| {
             a.p_buf
                 .extension()
@@ -1270,7 +1326,8 @@ fn sort_entries(entries: &mut Vec<PathData>, config: &Config) {
 
 #[cfg(windows)]
 fn is_hidden(file_path: &DirEntry) -> bool {
-    let metadata = fs::metadata(file_path.path()).unwrap();
+    let path = file_path.path();
+    let metadata = fs::metadata(&path).unwrap_or_else(|_| fs::symlink_metadata(&path).unwrap());
     let attr = metadata.file_attributes();
     (attr & 0x2) > 0
 }
@@ -1305,8 +1362,8 @@ fn enter_directory(dir: &PathData, config: &Config, out: &mut BufWriter<Stdout>)
         vec![]
     };
 
-    let mut temp: Vec<_> = safe_unwrap!(fs::read_dir(&dir.p_buf))
-        .map(|res| safe_unwrap!(res))
+    let mut temp: Vec<_> = crash_if_err!(1, fs::read_dir(&dir.p_buf))
+        .map(|res| crash_if_err!(1, res))
         .filter(|e| should_display(e, config))
         .map(|e| PathData::new(DirEntry::path(&e), Some(e.file_type()), None, config, false))
         .collect();
@@ -1331,7 +1388,7 @@ fn enter_directory(dir: &PathData, config: &Config, out: &mut BufWriter<Stdout>)
 
 fn get_metadata(entry: &Path, dereference: bool) -> std::io::Result<Metadata> {
     if dereference {
-        entry.metadata().or_else(|_| entry.symlink_metadata())
+        entry.metadata()
     } else {
         entry.symlink_metadata()
     }
@@ -1374,15 +1431,10 @@ fn display_items(items: &[PathData], config: &Config, out: &mut BufWriter<Stdout
     } else {
         let names = items.iter().filter_map(|i| display_file_name(i, config));
 
-        match (&config.format, config.width) {
-            (Format::Columns, Some(width)) => {
-                display_grid(names, width, Direction::TopToBottom, out)
-            }
-            (Format::Across, Some(width)) => {
-                display_grid(names, width, Direction::LeftToRight, out)
-            }
-            (Format::Commas, width_opt) => {
-                let term_width = width_opt.unwrap_or(1);
+        match config.format {
+            Format::Columns => display_grid(names, config.width, Direction::TopToBottom, out),
+            Format::Across => display_grid(names, config.width, Direction::LeftToRight, out),
+            Format::Commas => {
                 let mut current_col = 0;
                 let mut names = names;
                 if let Some(name) = names.next() {
@@ -1391,7 +1443,8 @@ fn display_items(items: &[PathData], config: &Config, out: &mut BufWriter<Stdout
                 }
                 for name in names {
                     let name_width = name.width as u16;
-                    if current_col + name_width + 1 > term_width {
+                    // If the width is 0 we print one single line
+                    if config.width != 0 && current_col + name_width + 1 > config.width {
                         current_col = name_width + 2;
                         let _ = write!(out, ",\n{}", name.contents);
                     } else {
@@ -1443,27 +1496,40 @@ fn display_grid(
     direction: Direction,
     out: &mut BufWriter<Stdout>,
 ) {
-    let mut grid = Grid::new(GridOptions {
-        filling: Filling::Spaces(2),
-        direction,
-    });
-
-    for name in names {
-        grid.add(name);
-    }
-
-    match grid.fit_into_width(width as usize) {
-        Some(output) => {
-            let _ = write!(out, "{}", output);
+    if width == 0 {
+        // If the width is 0 we print one single line
+        let mut printed_something = false;
+        for name in names {
+            if printed_something {
+                let _ = write!(out, "  ");
+            }
+            printed_something = true;
+            let _ = write!(out, "{}", name.contents);
         }
-        // Width is too small for the grid, so we fit it in one column
-        None => {
-            let _ = write!(out, "{}", grid.fit_into_columns(1));
+        if printed_something {
+            let _ = writeln!(out);
+        }
+    } else {
+        let mut grid = Grid::new(GridOptions {
+            filling: Filling::Spaces(2),
+            direction,
+        });
+
+        for name in names {
+            grid.add(name);
+        }
+
+        match grid.fit_into_width(width as usize) {
+            Some(output) => {
+                let _ = write!(out, "{}", output);
+            }
+            // Width is too small for the grid, so we fit it in one column
+            None => {
+                let _ = write!(out, "{}", grid.fit_into_columns(1));
+            }
         }
     }
 }
-
-use uucore::fs::display_permissions;
 
 fn display_item_long(
     item: &PathData,
@@ -1474,7 +1540,7 @@ fn display_item_long(
 ) {
     let md = match item.md() {
         None => {
-            show_error!("could not show file: {}", &item.p_buf.display());
+            show!(LsError::NoMetadata(item.p_buf.clone()));
             return;
         }
         Some(md) => md,
@@ -1555,7 +1621,7 @@ fn display_uname(metadata: &Metadata, config: &Config) -> String {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "redox")))]
 fn cached_gid2grp(gid: u32) -> String {
     lazy_static! {
         static ref GID_CACHE: Mutex<HashMap<u32, String>> = Mutex::new(HashMap::new());
@@ -1568,13 +1634,18 @@ fn cached_gid2grp(gid: u32) -> String {
         .clone()
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "redox")))]
 fn display_group(metadata: &Metadata, config: &Config) -> String {
     if config.long.numeric_uid_gid {
         metadata.gid().to_string()
     } else {
         cached_gid2grp(metadata.gid())
     }
+}
+
+#[cfg(target_os = "redox")]
+fn display_group(metadata: &Metadata, config: &Config) -> String {
+    metadata.gid().to_string()
 }
 
 #[cfg(not(unix))]
@@ -1733,7 +1804,11 @@ fn display_file_name(path: &PathData, config: &Config) -> Option<Cell> {
     #[cfg(unix)]
     {
         if config.format != Format::Long && config.inode {
-            name = get_inode(path.md()?) + " " + &name;
+            name = path
+                .md()
+                .map_or_else(|| "?".to_string(), |md| get_inode(md))
+                + " "
+                + &name;
         }
     }
 

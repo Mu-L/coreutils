@@ -48,14 +48,13 @@ use std::path::{Path, PathBuf, StripPrefixError};
 use std::str::FromStr;
 use std::string::ToString;
 use uucore::backup_control::{self, BackupMode};
-use uucore::fs::{canonicalize, CanonicalizeMode};
+use uucore::fs::{canonicalize, MissingHandling, ResolveMode};
 use walkdir::WalkDir;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 #[cfg(target_os = "linux")]
-#[allow(clippy::missing_safety_doc)]
 ioctl!(write ficlone with 0x94, 9; std::os::raw::c_int);
 
 quick_error! {
@@ -98,6 +97,9 @@ quick_error! {
         /// path, but those that are not implemented yet should return
         /// a NotImplemented error.
         NotImplemented(opt: String) { display("Option '{}' not yet implemented.", opt) }
+
+        /// Invalid arguments to backup
+        Backup(description: String) { display("{}\nTry '{} --help' for more information.", description, uucore::execution_phrase()) }
     }
 }
 
@@ -216,12 +218,12 @@ static LONG_HELP: &str = "";
 static EXIT_OK: i32 = 0;
 static EXIT_ERR: i32 = 1;
 
-fn get_usage() -> String {
+fn usage() -> String {
     format!(
         "{0} [OPTION]... [-T] SOURCE DEST
     {0} [OPTION]... SOURCE... DIRECTORY
     {0} [OPTION]... -t DIRECTORY SOURCE...",
-        executable!()
+        uucore::execution_phrase()
     )
 }
 
@@ -229,8 +231,6 @@ fn get_usage() -> String {
 mod options {
     pub const ARCHIVE: &str = "archive";
     pub const ATTRIBUTES_ONLY: &str = "attributes-only";
-    pub const BACKUP: &str = "backup";
-    pub const BACKUP_NO_ARG: &str = "b";
     pub const CLI_SYMBOLIC_LINKS: &str = "cli-symbolic-links";
     pub const CONTEXT: &str = "context";
     pub const COPY_CONTENTS: &str = "copy-contents";
@@ -255,7 +255,6 @@ mod options {
     pub const REMOVE_DESTINATION: &str = "remove-destination";
     pub const SPARSE: &str = "sparse";
     pub const STRIP_TRAILING_SLASHES: &str = "strip-trailing-slashes";
-    pub const SUFFIX: &str = "suffix";
     pub const SYMBOLIC_LINK: &str = "symbolic-link";
     pub const TARGET_DIRECTORY: &str = "target-directory";
     pub const UPDATE: &str = "update";
@@ -290,13 +289,10 @@ static DEFAULT_ATTRIBUTES: &[Attribute] = &[
     Attribute::Timestamps,
 ];
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
-    let matches = App::new(executable!())
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
-        .after_help(&*format!("{}\n{}", LONG_HELP, backup_control::BACKUP_CONTROL_LONG_HELP))
-        .usage(&usage[..])
         .arg(Arg::with_name(options::TARGET_DIRECTORY)
              .short("t")
              .conflicts_with(options::NO_TARGET_DIRECTORY)
@@ -356,29 +352,13 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
              .conflicts_with(options::FORCE)
              .help("remove each existing destination file before attempting to open it \
                     (contrast with --force). On Windows, current only works for writeable files."))
-        .arg(Arg::with_name(options::BACKUP)
-             .long(options::BACKUP)
-             .help("make a backup of each existing destination file")
-             .takes_value(true)
-             .require_equals(true)
-             .min_values(0)
-             .possible_values(backup_control::BACKUP_CONTROL_VALUES)
-             .value_name("CONTROL")
-        )
-        .arg(Arg::with_name(options::BACKUP_NO_ARG)
-             .short(options::BACKUP_NO_ARG)
-             .help("like --backup but does not accept an argument")
-        )
-        .arg(Arg::with_name(options::SUFFIX)
-             .short("S")
-             .long(options::SUFFIX)
-             .takes_value(true)
-             .value_name("SUFFIX")
-             .help("override the usual backup suffix"))
+        .arg(backup_control::arguments::backup())
+        .arg(backup_control::arguments::backup_no_args())
+        .arg(backup_control::arguments::suffix())
         .arg(Arg::with_name(options::UPDATE)
              .short("u")
              .long(options::UPDATE)
-             .help("copy only when the SOURCE file is newer than the destination file\
+             .help("copy only when the SOURCE file is newer than the destination file \
                     or when the destination file is missing"))
         .arg(Arg::with_name(options::REFLINK)
              .long(options::REFLINK)
@@ -401,7 +381,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
              .conflicts_with_all(&[options::PRESERVE_DEFAULT_ATTRIBUTES, options::NO_PRESERVE])
              // -d sets this option
              // --archive sets this option
-             .help("Preserve the specified attributes (default: mode(unix only),ownership,timestamps),\
+             .help("Preserve the specified attributes (default: mode (unix only), ownership, timestamps), \
                     if possible additional attributes: context, links, xattr, all"))
         .arg(Arg::with_name(options::PRESERVE_DEFAULT_ATTRIBUTES)
              .short("-p")
@@ -464,6 +444,17 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
 
         .arg(Arg::with_name(options::PATHS)
              .multiple(true))
+}
+
+pub fn uumain(args: impl uucore::Args) -> i32 {
+    let usage = usage();
+    let matches = uu_app()
+        .after_help(&*format!(
+            "{}\n{}",
+            LONG_HELP,
+            backup_control::BACKUP_CONTROL_LONG_HELP
+        ))
+        .usage(&usage[..])
         .get_matches_from(args);
 
     let options = crash_if_err!(EXIT_ERR, Options::from_matches(&matches));
@@ -595,12 +586,12 @@ impl Options {
             || matches.is_present(options::RECURSIVE_ALIAS)
             || matches.is_present(options::ARCHIVE);
 
-        let backup_mode = backup_control::determine_backup_mode(
-            matches.is_present(options::BACKUP_NO_ARG) || matches.is_present(options::BACKUP),
-            matches.value_of(options::BACKUP),
-        );
-        let backup_suffix =
-            backup_control::determine_backup_suffix(matches.value_of(options::SUFFIX));
+        let backup_mode = match backup_control::determine_backup_mode(matches) {
+            Err(e) => return Err(Error::Backup(format!("{}", e))),
+            Ok(mode) => mode,
+        };
+
+        let backup_suffix = backup_control::determine_backup_suffix(matches);
 
         let overwrite = OverwriteMode::from_matches(matches);
 
@@ -667,7 +658,14 @@ impl Options {
                         }
                     }
                 } else {
-                    ReflinkMode::Never
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    {
+                        ReflinkMode::Auto
+                    }
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                    {
+                        ReflinkMode::Never
+                    }
                 }
             },
             backup: backup_mode,
@@ -1036,7 +1034,7 @@ impl OverwriteMode {
         match *self {
             OverwriteMode::NoClobber => Err(Error::NotAllFilesCopied),
             OverwriteMode::Interactive(_) => {
-                if prompt_yes!("{}: overwrite {}? ", executable!(), path.display()) {
+                if prompt_yes!("{}: overwrite {}? ", uucore::util_name(), path.display()) {
                     Ok(())
                 } else {
                     Err(Error::Skipped(format!(
@@ -1218,28 +1216,39 @@ fn copy_file(source: &Path, dest: &Path, options: &Options) -> CopyResult<()> {
 /// Copy the file from `source` to `dest` either using the normal `fs::copy` or a
 /// copy-on-write scheme if --reflink is specified and the filesystem supports it.
 fn copy_helper(source: &Path, dest: &Path, options: &Options) -> CopyResult<()> {
-    if options.reflink_mode != ReflinkMode::Never {
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        return Err("--reflink is only supported on linux and macOS"
-            .to_string()
-            .into());
-
-        #[cfg(target_os = "macos")]
-        copy_on_write_macos(source, dest, options.reflink_mode)?;
-        #[cfg(target_os = "linux")]
-        copy_on_write_linux(source, dest, options.reflink_mode)?;
-    } else if !options.dereference && fs::symlink_metadata(&source)?.file_type().is_symlink() {
-        copy_link(source, dest)?;
-    } else if source.to_string_lossy() == "/dev/null" {
+    if options.parents {
+        let parent = dest.parent().unwrap_or(dest);
+        fs::create_dir_all(parent)?;
+    }
+    let is_symlink = fs::symlink_metadata(&source)?.file_type().is_symlink();
+    if source.to_string_lossy() == "/dev/null" {
         /* workaround a limitation of fs::copy
          * https://github.com/rust-lang/rust/issues/79390
          */
         File::create(dest)?;
-    } else {
-        if options.parents {
-            let parent = dest.parent().unwrap_or(dest);
-            fs::create_dir_all(parent)?;
+    } else if !options.dereference && is_symlink {
+        copy_link(source, dest)?;
+    } else if options.reflink_mode != ReflinkMode::Never {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return Err("--reflink is only supported on linux and macOS"
+            .to_string()
+            .into());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if is_symlink {
+            assert!(options.dereference);
+            let real_path = std::fs::read_link(source)?;
+
+            #[cfg(target_os = "macos")]
+            copy_on_write_macos(&real_path, dest, options.reflink_mode)?;
+            #[cfg(target_os = "linux")]
+            copy_on_write_linux(&real_path, dest, options.reflink_mode)?;
+        } else {
+            #[cfg(target_os = "macos")]
+            copy_on_write_macos(source, dest, options.reflink_mode)?;
+            #[cfg(target_os = "linux")]
+            copy_on_write_linux(source, dest, options.reflink_mode)?;
         }
+    } else {
         fs::copy(source, dest).context(&*context_for(source, dest))?;
     }
 
@@ -1254,11 +1263,16 @@ fn copy_link(source: &Path, dest: &Path) -> CopyResult<()> {
             Some(name) => dest.join(name).into(),
             None => crash!(
                 EXIT_ERR,
-                "cannot stat ‘{}’: No such file or directory",
+                "cannot stat '{}': No such file or directory",
                 source.display()
             ),
         }
     } else {
+        // we always need to remove the file to be able to create a symlink,
+        // even if it is writeable.
+        if dest.exists() {
+            fs::remove_file(dest)?;
+        }
         dest.into()
     };
     symlink_file(&link, &dest, &*context_for(&link, &dest))
@@ -1390,8 +1404,8 @@ pub fn localize_to_target(root: &Path, source: &Path, target: &Path) -> CopyResu
 
 pub fn paths_refer_to_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
     // We have to take symlinks and relative paths into account.
-    let pathbuf1 = canonicalize(p1, CanonicalizeMode::Normal)?;
-    let pathbuf2 = canonicalize(p2, CanonicalizeMode::Normal)?;
+    let pathbuf1 = canonicalize(p1, MissingHandling::Normal, ResolveMode::Logical)?;
+    let pathbuf2 = canonicalize(p2, MissingHandling::Normal, ResolveMode::Logical)?;
 
     Ok(pathbuf1 == pathbuf2)
 }

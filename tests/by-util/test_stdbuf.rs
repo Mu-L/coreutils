@@ -25,15 +25,19 @@ fn test_stdbuf_line_buffered_stdout() {
 #[cfg(not(target_os = "windows"))]
 #[test]
 fn test_stdbuf_no_buffer_option_fails() {
-    new_ucmd!().args(&["head"]).fails().stderr_is(
+    let ts = TestScenario::new(util_name!());
+
+    ts.ucmd().args(&["head"]).fails().stderr_is(&format!(
         "error: The following required arguments were not provided:\n    \
          --error <MODE>\n    \
          --input <MODE>\n    \
          --output <MODE>\n\n\
          USAGE:\n    \
-         stdbuf OPTION... COMMAND\n\n\
+         {1} {0} OPTION... COMMAND\n\n\
          For more information try --help",
-    );
+        ts.util_name,
+        ts.bin_path.to_string_lossy()
+    ));
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -49,9 +53,16 @@ fn test_stdbuf_trailing_var_arg() {
 #[cfg(not(target_os = "windows"))]
 #[test]
 fn test_stdbuf_line_buffering_stdin_fails() {
-    new_ucmd!().args(&["-i", "L", "head"]).fails().stderr_is(
-        "stdbuf: line buffering stdin is meaningless\nTry 'stdbuf --help' for more information.",
-    );
+    let ts = TestScenario::new(util_name!());
+
+    ts.ucmd()
+        .args(&["-i", "L", "head"])
+        .fails()
+        .stderr_is(&format!(
+            "{0}: line buffering stdin is meaningless\nTry '{1} {0} --help' for more information.",
+            ts.util_name,
+            ts.bin_path.to_string_lossy()
+        ));
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -63,12 +74,12 @@ fn test_stdbuf_invalid_mode_fails() {
             .args(&[*option, "1024R", "head"])
             .fails()
             .code_is(125)
-            .stderr_only("stdbuf: invalid mode ‘1024R’");
+            .stderr_only("stdbuf: invalid mode '1024R'");
         #[cfg(not(target_pointer_width = "128"))]
         new_ucmd!()
             .args(&[*option, "1Y", "head"])
             .fails()
             .code_is(125)
-            .stderr_contains("stdbuf: invalid mode ‘1Y’: Value too large for defined data type");
+            .stderr_contains("stdbuf: invalid mode '1Y': Value too large for defined data type");
     }
 }

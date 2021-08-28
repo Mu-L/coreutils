@@ -14,6 +14,9 @@ use clap::{crate_version, App, Arg, ArgMatches};
 use std::collections::hash_set::HashSet;
 use std::net::ToSocketAddrs;
 use std::str;
+#[cfg(windows)]
+use uucore::error::UUsageError;
+use uucore::error::{UResult, USimpleError};
 
 #[cfg(windows)]
 use winapi::shared::minwindef::MAKEWORD;
@@ -28,15 +31,18 @@ static OPT_FQDN: &str = "fqdn";
 static OPT_SHORT: &str = "short";
 static OPT_HOST: &str = "host";
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     #![allow(clippy::let_and_return)]
     #[cfg(windows)]
     unsafe {
         #[allow(deprecated)]
         let mut data = std::mem::uninitialized();
         if WSAStartup(MAKEWORD(2, 2), &mut data as *mut _) != 0 {
-            eprintln!("Failed to start Winsock 2.2");
-            return 1;
+            return Err(UUsageError::new(
+                1,
+                "Failed to start Winsock 2.2".to_string(),
+            ));
         }
     }
     let result = execute(args);
@@ -47,15 +53,30 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     result
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... [HOSTNAME]", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... [HOSTNAME]", uucore::execution_phrase())
 }
-fn execute(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
-    let matches = App::new(executable!())
+
+fn execute(args: impl uucore::Args) -> UResult<()> {
+    let usage = usage();
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+
+    match matches.value_of(OPT_HOST) {
+        None => display_hostname(&matches),
+        Some(host) => {
+            if let Err(err) = hostname::set(host) {
+                return Err(USimpleError::new(1, format!("{}", err)));
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
         .arg(
             Arg::with_name(OPT_DOMAIN)
                 .short("d")
@@ -80,22 +101,9 @@ fn execute(args: impl uucore::Args) -> i32 {
              possible",
         ))
         .arg(Arg::with_name(OPT_HOST))
-        .get_matches_from(args);
-
-    match matches.value_of(OPT_HOST) {
-        None => display_hostname(&matches),
-        Some(host) => {
-            if let Err(err) = hostname::set(host) {
-                show_error!("{}", err);
-                1
-            } else {
-                0
-            }
-        }
-    }
 }
 
-fn display_hostname(matches: &ArgMatches) -> i32 {
+fn display_hostname(matches: &ArgMatches) -> UResult<()> {
     let hostname = hostname::get().unwrap().into_string().unwrap();
 
     if matches.is_present(OPT_IP_ADDRESS) {
@@ -125,12 +133,10 @@ fn display_hostname(matches: &ArgMatches) -> i32 {
                     println!("{}", &output[0..len - 1]);
                 }
 
-                0
+                Ok(())
             }
             Err(f) => {
-                show_error!("{}", f);
-
-                1
+                return Err(USimpleError::new(1, format!("{}", f)));
             }
         }
     } else {
@@ -142,12 +148,12 @@ fn display_hostname(matches: &ArgMatches) -> i32 {
                 } else {
                     println!("{}", &hostname[ci.0 + 1..]);
                 }
-                return 0;
+                return Ok(());
             }
         }
 
         println!("{}", hostname);
 
-        0
+        Ok(())
     }
 }

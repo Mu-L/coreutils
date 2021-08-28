@@ -32,23 +32,13 @@ extern "C" {
     fn GetTickCount() -> uucore::libc::uint32_t;
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]...", uucore::execution_phrase())
 }
 
 pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::SINCE)
-                .short("s")
-                .long(options::SINCE)
-                .help("system up since"),
-        )
-        .get_matches_from(args);
+    let usage = usage();
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
 
     let (boot_time, user_count) = process_utmpx();
     let uptime = get_uptime(boot_time);
@@ -71,6 +61,18 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
 
         0
     }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .arg(
+            Arg::with_name(options::SINCE)
+                .short("s")
+                .long(options::SINCE)
+                .help("system up since"),
+        )
 }
 
 #[cfg(unix)]

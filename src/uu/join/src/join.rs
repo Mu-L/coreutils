@@ -19,7 +19,6 @@ static NAME: &str = "join";
 
 #[derive(Copy, Clone, PartialEq)]
 enum FileNum {
-    None,
     File1,
     File2,
 }
@@ -41,7 +40,8 @@ enum CheckOrder {
 struct Settings {
     key1: usize,
     key2: usize,
-    print_unpaired: FileNum,
+    print_unpaired1: bool,
+    print_unpaired2: bool,
     print_joined: bool,
     ignore_case: bool,
     separator: Sep,
@@ -57,7 +57,8 @@ impl Default for Settings {
         Settings {
             key1: 0,
             key2: 0,
-            print_unpaired: FileNum::None,
+            print_unpaired1: false,
+            print_unpaired2: false,
             print_joined: true,
             ignore_case: false,
             separator: Sep::Whitespaces,
@@ -243,7 +244,7 @@ impl<'a> State<'a> {
         name: &'a str,
         stdin: &'a Stdin,
         key: usize,
-        print_unpaired: FileNum,
+        print_unpaired: bool,
     ) -> State<'a> {
         let f = if name == "-" {
             Box::new(stdin.lock()) as Box<dyn BufRead>
@@ -258,7 +259,7 @@ impl<'a> State<'a> {
             key,
             file_name: name,
             file_num,
-            print_unpaired: print_unpaired == file_num,
+            print_unpaired,
             lines: f.lines(),
             seq: Vec::new(),
             max_fields: None,
@@ -442,7 +443,80 @@ impl<'a> State<'a> {
 }
 
 pub fn uumain(args: impl uucore::Args) -> i32 {
-    let matches = App::new(NAME)
+    let matches = uu_app().get_matches_from(args);
+
+    let keys = parse_field_number_option(matches.value_of("j"));
+    let key1 = parse_field_number_option(matches.value_of("1"));
+    let key2 = parse_field_number_option(matches.value_of("2"));
+
+    let mut settings: Settings = Default::default();
+
+    let v_values = matches.values_of("v");
+    if v_values.is_some() {
+        settings.print_joined = false;
+    }
+
+    let unpaired = v_values
+        .unwrap_or_default()
+        .chain(matches.values_of("a").unwrap_or_default());
+    for file_num in unpaired {
+        match parse_file_number(file_num) {
+            FileNum::File1 => settings.print_unpaired1 = true,
+            FileNum::File2 => settings.print_unpaired2 = true,
+        }
+    }
+
+    settings.ignore_case = matches.is_present("i");
+    settings.key1 = get_field_number(keys, key1);
+    settings.key2 = get_field_number(keys, key2);
+
+    if let Some(value) = matches.value_of("t") {
+        settings.separator = match value.len() {
+            0 => Sep::Line,
+            1 => Sep::Char(value.chars().next().unwrap()),
+            _ => crash!(1, "multi-character tab {}", value),
+        };
+    }
+
+    if let Some(format) = matches.value_of("o") {
+        if format == "auto" {
+            settings.autoformat = true;
+        } else {
+            settings.format = format
+                .split(|c| c == ' ' || c == ',' || c == '\t')
+                .map(Spec::parse)
+                .collect();
+        }
+    }
+
+    if let Some(empty) = matches.value_of("e") {
+        settings.empty = empty.to_string();
+    }
+
+    if matches.is_present("nocheck-order") {
+        settings.check_order = CheckOrder::Disabled;
+    }
+
+    if matches.is_present("check-order") {
+        settings.check_order = CheckOrder::Enabled;
+    }
+
+    if matches.is_present("header") {
+        settings.headers = true;
+    }
+
+    let file1 = matches.value_of("file1").unwrap();
+    let file2 = matches.value_of("file2").unwrap();
+
+    if file1 == "-" && file2 == "-" {
+        crash!(1, "both files cannot be standard input");
+    }
+
+    exec(file1, file2, &settings)
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(NAME)
         .version(crate_version!())
         .about(
             "For each pair of input lines with identical join fields, write a line to
@@ -455,7 +529,8 @@ When FILE1 or FILE2 (not both) is -, read standard input.",
         .arg(
             Arg::with_name("a")
                 .short("a")
-                .takes_value(true)
+                .multiple(true)
+                .number_of_values(1)
                 .possible_values(&["1", "2"])
                 .value_name("FILENUM")
                 .help(
@@ -466,6 +541,9 @@ FILENUM is 1 or 2, corresponding to FILE1 or FILE2",
         .arg(
             Arg::with_name("v")
                 .short("v")
+                .multiple(true)
+                .number_of_values(1)
+                .possible_values(&["1", "2"])
                 .value_name("FILENUM")
                 .help("like -a FILENUM, but suppress joined output lines"),
         )
@@ -542,68 +620,6 @@ FILENUM is 1 or 2, corresponding to FILE1 or FILE2",
                 .value_name("FILE2")
                 .hidden(true),
         )
-        .get_matches_from(args);
-
-    let keys = parse_field_number_option(matches.value_of("j"));
-    let key1 = parse_field_number_option(matches.value_of("1"));
-    let key2 = parse_field_number_option(matches.value_of("2"));
-
-    let mut settings: Settings = Default::default();
-
-    if let Some(value) = matches.value_of("v") {
-        settings.print_unpaired = parse_file_number(value);
-        settings.print_joined = false;
-    } else if let Some(value) = matches.value_of("a") {
-        settings.print_unpaired = parse_file_number(value);
-    }
-
-    settings.ignore_case = matches.is_present("i");
-    settings.key1 = get_field_number(keys, key1);
-    settings.key2 = get_field_number(keys, key2);
-
-    if let Some(value) = matches.value_of("t") {
-        settings.separator = match value.len() {
-            0 => Sep::Line,
-            1 => Sep::Char(value.chars().next().unwrap()),
-            _ => crash!(1, "multi-character tab {}", value),
-        };
-    }
-
-    if let Some(format) = matches.value_of("o") {
-        if format == "auto" {
-            settings.autoformat = true;
-        } else {
-            settings.format = format
-                .split(|c| c == ' ' || c == ',' || c == '\t')
-                .map(Spec::parse)
-                .collect();
-        }
-    }
-
-    if let Some(empty) = matches.value_of("e") {
-        settings.empty = empty.to_string();
-    }
-
-    if matches.is_present("nocheck-order") {
-        settings.check_order = CheckOrder::Disabled;
-    }
-
-    if matches.is_present("check-order") {
-        settings.check_order = CheckOrder::Enabled;
-    }
-
-    if matches.is_present("header") {
-        settings.headers = true;
-    }
-
-    let file1 = matches.value_of("file1").unwrap();
-    let file2 = matches.value_of("file2").unwrap();
-
-    if file1 == "-" && file2 == "-" {
-        crash!(1, "both files cannot be standard input");
-    }
-
-    exec(file1, file2, &settings)
 }
 
 fn exec(file1: &str, file2: &str, settings: &Settings) -> i32 {
@@ -614,7 +630,7 @@ fn exec(file1: &str, file2: &str, settings: &Settings) -> i32 {
         file1,
         &stdin,
         settings.key1,
-        settings.print_unpaired,
+        settings.print_unpaired1,
     );
 
     let mut state2 = State::new(
@@ -622,7 +638,7 @@ fn exec(file1: &str, file2: &str, settings: &Settings) -> i32 {
         file2,
         &stdin,
         settings.key2,
-        settings.print_unpaired,
+        settings.print_unpaired2,
     );
 
     let input = Input::new(

@@ -32,32 +32,14 @@ struct Options {
     files: Vec<String>,
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... [FILE]...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... [FILE]...", uucore::execution_phrase())
 }
 
 pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+    let usage = usage();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
-        .usage(&usage[..])
-        .after_help("If a FILE is -, it refers to a file named - .")
-        .arg(
-            Arg::with_name(options::APPEND)
-                .long(options::APPEND)
-                .short("a")
-                .help("append to the given FILEs, do not overwrite"),
-        )
-        .arg(
-            Arg::with_name(options::IGNORE_INTERRUPTS)
-                .long(options::IGNORE_INTERRUPTS)
-                .short("i")
-                .help("ignore interrupt signals (ignored on non-Unix platforms)"),
-        )
-        .arg(Arg::with_name(options::FILE).multiple(true))
-        .get_matches_from(args);
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
 
     let options = Options {
         append: matches.is_present(options::APPEND),
@@ -72,6 +54,26 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         Ok(_) => 0,
         Err(_) => 1,
     }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .after_help("If a FILE is -, it refers to a file named - .")
+        .arg(
+            Arg::with_name(options::APPEND)
+                .long(options::APPEND)
+                .short("a")
+                .help("append to the given FILEs, do not overwrite"),
+        )
+        .arg(
+            Arg::with_name(options::IGNORE_INTERRUPTS)
+                .long(options::IGNORE_INTERRUPTS)
+                .short("i")
+                .help("ignore interrupt signals (ignored on non-Unix platforms)"),
+        )
+        .arg(Arg::with_name(options::FILE).multiple(true))
 }
 
 #[cfg(unix)]

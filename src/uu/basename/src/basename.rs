@@ -17,11 +17,11 @@ use uucore::InvalidEncodingHandling;
 static SUMMARY: &str = "Print NAME with any leading directory components removed
 If specified, also remove a trailing SUFFIX";
 
-fn get_usage() -> String {
+fn usage() -> String {
     format!(
         "{0} NAME [SUFFIX]
     {0} OPTION... NAME...",
-        executable!()
+        uucore::execution_phrase()
     )
 }
 
@@ -36,42 +36,18 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
-    let usage = get_usage();
+    let usage = usage();
     //
     // Argument parsing
     //
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(SUMMARY)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::MULTIPLE)
-                .short("a")
-                .long(options::MULTIPLE)
-                .help("support multiple arguments and treat each as a NAME"),
-        )
-        .arg(Arg::with_name(options::NAME).multiple(true).hidden(true))
-        .arg(
-            Arg::with_name(options::SUFFIX)
-                .short("s")
-                .long(options::SUFFIX)
-                .value_name("SUFFIX")
-                .help("remove a trailing SUFFIX; implies -a"),
-        )
-        .arg(
-            Arg::with_name(options::ZERO)
-                .short("z")
-                .long(options::ZERO)
-                .help("end each output line with NUL, not newline"),
-        )
-        .get_matches_from(args);
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
 
     // too few arguments
     if !matches.is_present(options::NAME) {
         crash!(
             1,
             "{1}\nTry '{0} --help' for more information.",
-            executable!(),
+            uucore::execution_phrase(),
             "missing operand"
         );
     }
@@ -85,7 +61,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         crash!(
             1,
             "extra operand '{1}'\nTry '{0} --help' for more information.",
-            executable!(),
+            uucore::execution_phrase(),
             matches.values_of(options::NAME).unwrap().nth(2).unwrap()
         );
     }
@@ -116,9 +92,41 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     0
 }
 
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(SUMMARY)
+        .arg(
+            Arg::with_name(options::MULTIPLE)
+                .short("a")
+                .long(options::MULTIPLE)
+                .help("support multiple arguments and treat each as a NAME"),
+        )
+        .arg(Arg::with_name(options::NAME).multiple(true).hidden(true))
+        .arg(
+            Arg::with_name(options::SUFFIX)
+                .short("s")
+                .long(options::SUFFIX)
+                .value_name("SUFFIX")
+                .help("remove a trailing SUFFIX; implies -a"),
+        )
+        .arg(
+            Arg::with_name(options::ZERO)
+                .short("z")
+                .long(options::ZERO)
+                .help("end each output line with NUL, not newline"),
+        )
+}
+
 fn basename(fullname: &str, suffix: &str) -> String {
-    // Remove all platform-specific path separators from the end
+    // Remove all platform-specific path separators from the end.
     let path = fullname.trim_end_matches(is_separator);
+
+    // If the path contained *only* suffix characters (for example, if
+    // `fullname` were "///" and `suffix` were "/"), then `path` would
+    // be left with the empty string. In that case, we set `path` to be
+    // the original `fullname` to avoid returning the empty path.
+    let path = if path.is_empty() { fullname } else { path };
 
     // Convert to path buffer and get last path component
     let pb = PathBuf::from(path);

@@ -9,7 +9,8 @@
 // spell-checker:ignore (words) writeback wipesync
 
 use clap::{crate_version, App, Arg};
-use rand::{Rng, ThreadRng};
+use rand::prelude::SliceRandom;
+use rand::Rng;
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -119,7 +120,7 @@ struct BytesGenerator<'a> {
     block_size: usize,
     exact: bool, // if false, every block's size is block_size
     gen_type: PassType<'a>,
-    rng: Option<RefCell<ThreadRng>>,
+    rng: Option<RefCell<rand::rngs::ThreadRng>>,
     bytes: [u8; BLOCK_SIZE],
 }
 
@@ -213,8 +214,8 @@ static ABOUT: &str = "Overwrite the specified FILE(s) repeatedly, in order to ma
 for even very expensive hardware probing to recover the data.
 ";
 
-fn get_usage() -> String {
-    format!("{} [OPTION]... FILE...", executable!())
+fn usage() -> String {
+    format!("{} [OPTION]... FILE...", uucore::execution_phrase())
 }
 
 static AFTER_HELP: &str =
@@ -270,64 +271,9 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let usage = get_usage();
+    let usage = usage();
 
-    let app = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
-        .after_help(AFTER_HELP)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::FORCE)
-                .long(options::FORCE)
-                .short("f")
-                .help("change permissions to allow writing if necessary"),
-        )
-        .arg(
-            Arg::with_name(options::ITERATIONS)
-                .long(options::ITERATIONS)
-                .short("n")
-                .help("overwrite N times instead of the default (3)")
-                .value_name("NUMBER")
-                .default_value("3"),
-        )
-        .arg(
-            Arg::with_name(options::SIZE)
-                .long(options::SIZE)
-                .short("s")
-                .takes_value(true)
-                .value_name("N")
-                .help("shred this many bytes (suffixes like K, M, G accepted)"),
-        )
-        .arg(
-            Arg::with_name(options::REMOVE)
-                .short("u")
-                .long(options::REMOVE)
-                .help("truncate and remove file after overwriting;  See below"),
-        )
-        .arg(
-            Arg::with_name(options::VERBOSE)
-                .long(options::VERBOSE)
-                .short("v")
-                .help("show progress"),
-        )
-        .arg(
-            Arg::with_name(options::EXACT)
-                .long(options::EXACT)
-                .short("x")
-                .help(
-                    "do not round file sizes up to the next full block;\n\
-                     this is the default for non-regular files",
-                ),
-        )
-        .arg(
-            Arg::with_name(options::ZERO)
-                .long(options::ZERO)
-                .short("z")
-                .help("add a final overwrite with zeros to hide shredding"),
-        )
-        // Positional arguments
-        .arg(Arg::with_name(options::FILE).hidden(true).multiple(true));
+    let app = uu_app().usage(&usage[..]);
 
     let matches = app.get_matches_from(args);
 
@@ -382,6 +328,64 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     }
 
     0
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .after_help(AFTER_HELP)
+        .arg(
+            Arg::with_name(options::FORCE)
+                .long(options::FORCE)
+                .short("f")
+                .help("change permissions to allow writing if necessary"),
+        )
+        .arg(
+            Arg::with_name(options::ITERATIONS)
+                .long(options::ITERATIONS)
+                .short("n")
+                .help("overwrite N times instead of the default (3)")
+                .value_name("NUMBER")
+                .default_value("3"),
+        )
+        .arg(
+            Arg::with_name(options::SIZE)
+                .long(options::SIZE)
+                .short("s")
+                .takes_value(true)
+                .value_name("N")
+                .help("shred this many bytes (suffixes like K, M, G accepted)"),
+        )
+        .arg(
+            Arg::with_name(options::REMOVE)
+                .short("u")
+                .long(options::REMOVE)
+                .help("truncate and remove file after overwriting;  See below"),
+        )
+        .arg(
+            Arg::with_name(options::VERBOSE)
+                .long(options::VERBOSE)
+                .short("v")
+                .help("show progress"),
+        )
+        .arg(
+            Arg::with_name(options::EXACT)
+                .long(options::EXACT)
+                .short("x")
+                .help(
+                    "do not round file sizes up to the next full block;\n\
+                     this is the default for non-regular files",
+                ),
+        )
+        .arg(
+            Arg::with_name(options::ZERO)
+                .long(options::ZERO)
+                .short("z")
+                .help("add a final overwrite with zeros to hide shredding"),
+        )
+        // Positional arguments
+        .arg(Arg::with_name(options::FILE).hidden(true).multiple(true))
 }
 
 // TODO: Add support for all postfixes here up to and including EiB
@@ -496,7 +500,8 @@ fn wipe_file(
         for pattern in PATTERNS.iter().take(remainder) {
             pass_sequence.push(PassType::Pattern(pattern));
         }
-        rand::thread_rng().shuffle(&mut pass_sequence[..]); // randomize the order of application
+        let mut rng = rand::thread_rng();
+        pass_sequence.shuffle(&mut rng); // randomize the order of application
 
         let n_random = 3 + n_passes / 10; // Minimum 3 random passes; ratio of 10 after
                                           // Evenly space random passes; ensures one at the beginning and end

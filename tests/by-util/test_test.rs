@@ -165,7 +165,7 @@ fn test_dangling_string_comparison_is_error() {
         .args(&["missing_something", "="])
         .run()
         .status_code(2)
-        .stderr_is("test: missing argument after ‘=’");
+        .stderr_is("test: missing argument after '='");
 }
 
 #[test]
@@ -265,7 +265,7 @@ fn test_float_inequality_is_error() {
         .args(&["123.45", "-ge", "6"])
         .run()
         .status_code(2)
-        .stderr_is("test: invalid integer ‘123.45’");
+        .stderr_is("test: invalid integer '123.45'");
 }
 
 #[test]
@@ -283,7 +283,7 @@ fn test_invalid_utf8_integer_compare() {
 
     cmd.run()
         .status_code(2)
-        .stderr_is("test: invalid integer ‘fo�o’");
+        .stderr_is("test: invalid integer 'fo�o'");
 
     let mut cmd = new_ucmd!();
     cmd.raw.arg(arg);
@@ -291,7 +291,7 @@ fn test_invalid_utf8_integer_compare() {
 
     cmd.run()
         .status_code(2)
-        .stderr_is("test: invalid integer ‘fo�o’");
+        .stderr_is("test: invalid integer 'fo�o'");
 }
 
 #[test]
@@ -477,7 +477,9 @@ fn test_nonexistent_file_is_not_symlink() {
 }
 
 #[test]
-#[cfg(not(windows))] // Windows has no concept of sticky bit
+// FixME: freebsd fails with 'chmod: sticky_file: Inappropriate file type or format'
+// Windows has no concept of sticky bit
+#[cfg(not(any(windows, target_os = "freebsd")))]
 fn test_file_is_sticky() {
     let scenario = TestScenario::new(util_name!());
     let mut ucmd = scenario.ucmd();
@@ -674,7 +676,7 @@ fn test_erroneous_parenthesized_expression() {
         .args(&["a", "!=", "(", "b", "-a", "b", ")", "!=", "c"])
         .run()
         .status_code(2)
-        .stderr_is("test: extra argument ‘b’");
+        .stderr_is("test: extra argument 'b'");
 }
 
 #[test]
@@ -717,4 +719,22 @@ fn test_bracket_syntax_missing_right_bracket() {
         .run()
         .status_code(2)
         .stderr_is("[: missing ']'");
+}
+
+#[test]
+fn test_bracket_syntax_help() {
+    let scenario = TestScenario::new("[");
+    let mut ucmd = scenario.ucmd();
+
+    ucmd.arg("--help").succeeds().stdout_contains("USAGE:");
+}
+
+#[test]
+fn test_bracket_syntax_version() {
+    let scenario = TestScenario::new("[");
+    let mut ucmd = scenario.ucmd();
+
+    ucmd.arg("--version")
+        .succeeds()
+        .stdout_matches(&r"\[ \d+\.\d+\.\d+".parse().unwrap());
 }

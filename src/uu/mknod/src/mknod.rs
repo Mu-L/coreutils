@@ -18,7 +18,6 @@ use libc::{S_IFBLK, S_IFCHR, S_IFIFO, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP, S_IWOT
 
 use uucore::InvalidEncodingHandling;
 
-static NAME: &str = "mknod";
 static ABOUT: &str = "Create the special file NAME of the given TYPE.";
 static USAGE: &str = "mknod [OPTION]... NAME TYPE [MAJOR MINOR]";
 static LONG_HELP: &str = "Mandatory arguments to long options are mandatory for short options too.
@@ -72,7 +71,8 @@ fn _mknod(file_name: &str, mode: mode_t, dev: dev_t) -> i32 {
         }
 
         if errno == -1 {
-            let c_str = CString::new(NAME).expect("Failed to convert to CString");
+            let c_str = CString::new(uucore::execution_phrase().as_bytes())
+                .expect("Failed to convert to CString");
             // shows the error from the mknod syscall
             libc::perror(c_str.as_ptr());
         }
@@ -89,7 +89,69 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     // opts.optflag("Z", "", "set the SELinux security context to default type");
     // opts.optopt("", "context", "like -Z, or if CTX is specified then set the SELinux or SMACK security context to CTX");
 
-    let matches = App::new(executable!())
+    let matches = uu_app().get_matches_from(args);
+
+    let mode = match get_mode(&matches) {
+        Ok(mode) => mode,
+        Err(err) => {
+            show_error!("{}", err);
+            return 1;
+        }
+    };
+
+    let file_name = matches.value_of("name").expect("Missing argument 'NAME'");
+
+    // Only check the first character, to allow mnemonic usage like
+    // 'mknod /dev/rst0 character 18 0'.
+    let ch = matches
+        .value_of("type")
+        .expect("Missing argument 'TYPE'")
+        .chars()
+        .next()
+        .expect("Failed to get the first char");
+
+    if ch == 'p' {
+        if matches.is_present("major") || matches.is_present("minor") {
+            eprintln!("Fifos do not have major and minor device numbers.");
+            eprintln!(
+                "Try '{} --help' for more information.",
+                uucore::execution_phrase()
+            );
+            1
+        } else {
+            _mknod(file_name, S_IFIFO | mode, 0)
+        }
+    } else {
+        match (matches.value_of("major"), matches.value_of("minor")) {
+            (None, None) | (_, None) | (None, _) => {
+                eprintln!("Special files require major and minor device numbers.");
+                eprintln!(
+                    "Try '{} --help' for more information.",
+                    uucore::execution_phrase()
+                );
+                1
+            }
+            (Some(major), Some(minor)) => {
+                let major = major.parse::<u64>().expect("validated by clap");
+                let minor = minor.parse::<u64>().expect("validated by clap");
+
+                let dev = makedev(major, minor);
+                if ch == 'b' {
+                    // block special file
+                    _mknod(file_name, S_IFBLK | mode, dev)
+                } else if ch == 'c' || ch == 'u' {
+                    // char special file
+                    _mknod(file_name, S_IFCHR | mode, dev)
+                } else {
+                    unreachable!("{} was validated to be only b, c or u", ch);
+                }
+            }
+        }
+    }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .usage(USAGE)
         .after_help(LONG_HELP)
@@ -130,59 +192,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .validator(valid_u64)
                 .index(4),
         )
-        .get_matches_from(args);
-
-    let mode = match get_mode(&matches) {
-        Ok(mode) => mode,
-        Err(err) => {
-            show_error!("{}", err);
-            return 1;
-        }
-    };
-
-    let file_name = matches.value_of("name").expect("Missing argument 'NAME'");
-
-    // Only check the first character, to allow mnemonic usage like
-    // 'mknod /dev/rst0 character 18 0'.
-    let ch = matches
-        .value_of("type")
-        .expect("Missing argument 'TYPE'")
-        .chars()
-        .next()
-        .expect("Failed to get the first char");
-
-    if ch == 'p' {
-        if matches.is_present("major") || matches.is_present("minor") {
-            eprintln!("Fifos do not have major and minor device numbers.");
-            eprintln!("Try '{} --help' for more information.", NAME);
-            1
-        } else {
-            _mknod(file_name, S_IFIFO | mode, 0)
-        }
-    } else {
-        match (matches.value_of("major"), matches.value_of("minor")) {
-            (None, None) | (_, None) | (None, _) => {
-                eprintln!("Special files require major and minor device numbers.");
-                eprintln!("Try '{} --help' for more information.", NAME);
-                1
-            }
-            (Some(major), Some(minor)) => {
-                let major = major.parse::<u64>().expect("validated by clap");
-                let minor = minor.parse::<u64>().expect("validated by clap");
-
-                let dev = makedev(major, minor);
-                if ch == 'b' {
-                    // block special file
-                    _mknod(file_name, S_IFBLK | mode, dev)
-                } else if ch == 'c' || ch == 'u' {
-                    // char special file
-                    _mknod(file_name, S_IFCHR | mode, dev)
-                } else {
-                    unreachable!("{} was validated to be only b, c or u", ch);
-                }
-            }
-        }
-    }
 }
 
 fn get_mode(matches: &ArgMatches) -> Result<mode_t, String> {
@@ -210,7 +219,7 @@ fn valid_type(tpe: String) -> Result<(), String> {
             if vec!['b', 'c', 'u', 'p'].contains(&first_char) {
                 Ok(())
             } else {
-                Err(format!("invalid device type ‘{}’", tpe))
+                Err(format!("invalid device type '{}'", tpe))
             }
         })
 }

@@ -167,6 +167,11 @@ quick_error! {
     }
 }
 
+pub fn uu_app() -> clap::App<'static, 'static> {
+    // TODO: migrate to clap to get more shell completions
+    clap::App::new(uucore::util_name())
+}
+
 pub fn uumain(args: impl uucore::Args) -> i32 {
     let args = args
         .collect_str(uucore::InvalidEncodingHandling::Ignore)
