@@ -22,31 +22,37 @@ mod custom_str_cmp;
 mod ext_sort;
 mod merge;
 mod numeric_str_cmp;
+mod tmp_dir;
 
+use chunks::LineData;
 use clap::{crate_version, App, Arg};
 use custom_str_cmp::custom_str_cmp;
 use ext_sort::ext_sort;
 use fnv::FnvHasher;
-use itertools::Itertools;
-use numeric_str_cmp::{numeric_str_cmp, NumInfo, NumInfoParseSettings};
-use rand::distributions::Alphanumeric;
+use numeric_str_cmp::{human_numeric_str_cmp, numeric_str_cmp, NumInfo, NumInfoParseSettings};
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
-use semver::Version;
 use std::cmp::Ordering;
 use std::env;
-use std::ffi::OsStr;
-use std::fs::File;
+use std::error::Error;
+use std::ffi::{OsStr, OsString};
+use std::fmt::Display;
+use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{stdin, stdout, BufRead, BufReader, BufWriter, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::Utf8Error;
 use unicode_width::UnicodeWidthStr;
+use uucore::display::Quotable;
+use uucore::error::{set_exit_code, strip_errno, UError, UResult, USimpleError, UUsageError};
 use uucore::parse_size::{parse_size, ParseSizeError};
+use uucore::version_cmp::version_cmp;
 use uucore::InvalidEncodingHandling;
 
-const NAME: &str = "sort";
+use crate::tmp_dir::TmpDirWrapper;
+
 const ABOUT: &str = "Display sorted concatenation of all FILE(s).";
 
 const LONG_HELP_KEYS: &str = "The key format is FIELD[.CHAR][OPTIONS][,FIELD[.CHAR]][OPTIONS].
@@ -121,6 +127,107 @@ const POSITIVE: char = '+';
 // available memory into consideration, instead of relying on this constant only.
 const DEFAULT_BUF_SIZE: usize = 1_000_000_000; // 1 GB
 
+#[derive(Debug)]
+enum SortError {
+    Disorder {
+        file: OsString,
+        line_number: usize,
+        line: String,
+        silent: bool,
+    },
+    OpenFailed {
+        path: String,
+        error: std::io::Error,
+    },
+    ReadFailed {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    ParseKeyError {
+        key: String,
+        msg: String,
+    },
+    OpenTmpFileFailed {
+        error: std::io::Error,
+    },
+    CompressProgExecutionFailed {
+        code: i32,
+    },
+    CompressProgTerminatedAbnormally {
+        prog: String,
+    },
+    TmpDirCreationFailed,
+    Uft8Error {
+        error: Utf8Error,
+    },
+}
+
+impl Error for SortError {}
+
+impl UError for SortError {
+    fn code(&self) -> i32 {
+        match self {
+            SortError::Disorder { .. } => 1,
+            _ => 2,
+        }
+    }
+}
+
+impl Display for SortError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SortError::Disorder {
+                file,
+                line_number,
+                line,
+                silent,
+            } => {
+                if !silent {
+                    write!(
+                        f,
+                        "{}:{}: disorder: {}",
+                        file.maybe_quote(),
+                        line_number,
+                        line
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            SortError::OpenFailed { path, error } => {
+                write!(
+                    f,
+                    "open failed: {}: {}",
+                    path.maybe_quote(),
+                    strip_errno(error)
+                )
+            }
+            SortError::ParseKeyError { key, msg } => {
+                write!(f, "failed to parse key {}: {}", key.quote(), msg)
+            }
+            SortError::ReadFailed { path, error } => {
+                write!(
+                    f,
+                    "cannot read: {}: {}",
+                    path.maybe_quote(),
+                    strip_errno(error)
+                )
+            }
+            SortError::OpenTmpFileFailed { error } => {
+                write!(f, "failed to open temporary file: {}", strip_errno(error))
+            }
+            SortError::CompressProgExecutionFailed { code } => {
+                write!(f, "couldn't execute compress program: errno {}", code)
+            }
+            SortError::CompressProgTerminatedAbnormally { prog } => {
+                write!(f, "{} terminated abnormally", prog.quote())
+            }
+            SortError::TmpDirCreationFailed => write!(f, "could not create temporary directory"),
+            SortError::Uft8Error { error } => write!(f, "{}", error),
+        }
+    }
+}
+
 #[derive(Eq, Ord, PartialEq, PartialOrd, Clone, Copy, Debug)]
 enum SortMode {
     Numeric,
@@ -146,6 +253,49 @@ impl SortMode {
     }
 }
 
+pub struct Output {
+    file: Option<(String, File)>,
+}
+
+impl Output {
+    fn new(name: Option<&str>) -> UResult<Self> {
+        let file = if let Some(name) = name {
+            // This is different from `File::create()` because we don't truncate the output yet.
+            // This allows using the output file as an input file.
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(name)
+                .map_err(|e| SortError::OpenFailed {
+                    path: name.to_owned(),
+                    error: e,
+                })?;
+            Some((name.to_owned(), file))
+        } else {
+            None
+        };
+        Ok(Self { file })
+    }
+
+    fn into_write(self) -> BufWriter<Box<dyn Write>> {
+        BufWriter::new(match self.file {
+            Some((_name, file)) => {
+                // truncate the file
+                let _ = file.set_len(0);
+                Box::new(file)
+            }
+            None => Box::new(stdout()),
+        })
+    }
+
+    fn as_output_name(&self) -> Option<&str> {
+        match &self.file {
+            Some((name, _file)) => Some(name),
+            None => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct GlobalSettings {
     mode: SortMode,
@@ -156,20 +306,29 @@ pub struct GlobalSettings {
     ignore_non_printing: bool,
     merge: bool,
     reverse: bool,
-    output_file: Option<String>,
     stable: bool,
     unique: bool,
     check: bool,
     check_silent: bool,
-    salt: String,
+    salt: Option<[u8; 16]>,
     selectors: Vec<FieldSelector>,
     separator: Option<char>,
     threads: String,
     zero_terminated: bool,
     buffer_size: usize,
-    tmp_dir: PathBuf,
     compress_prog: Option<String>,
     merge_batch_size: usize,
+    precomputed: Precomputed,
+}
+
+/// Data needed for sorting. Should be computed once before starting to sort
+/// by calling `GlobalSettings::init_precomputed`.
+#[derive(Clone, Debug)]
+struct Precomputed {
+    needs_tokens: bool,
+    num_infos_per_line: usize,
+    floats_per_line: usize,
+    selections_per_line: usize,
 }
 
 impl GlobalSettings {
@@ -198,17 +357,23 @@ impl GlobalSettings {
         }
     }
 
-    fn out_writer(&self) -> BufWriter<Box<dyn Write>> {
-        match self.output_file {
-            Some(ref filename) => match File::create(Path::new(&filename)) {
-                Ok(f) => BufWriter::new(Box::new(f) as Box<dyn Write>),
-                Err(e) => {
-                    show_error!("{0}: {1}", filename, e.to_string());
-                    panic!("Could not open output file");
-                }
-            },
-            None => BufWriter::new(Box::new(stdout()) as Box<dyn Write>),
-        }
+    /// Precompute some data needed for sorting.
+    /// This function **must** be called before starting to sort, and `GlobalSettings` may not be altered
+    /// afterwards.
+    fn init_precomputed(&mut self) {
+        self.precomputed.needs_tokens = self.selectors.iter().any(|s| s.needs_tokens);
+        self.precomputed.selections_per_line =
+            self.selectors.iter().filter(|s| s.needs_selection).count();
+        self.precomputed.num_infos_per_line = self
+            .selectors
+            .iter()
+            .filter(|s| matches!(s.settings.mode, SortMode::Numeric | SortMode::HumanNumeric))
+            .count();
+        self.precomputed.floats_per_line = self
+            .selectors
+            .iter()
+            .filter(|s| matches!(s.settings.mode, SortMode::GeneralNumeric))
+            .count();
     }
 }
 
@@ -223,23 +388,28 @@ impl Default for GlobalSettings {
             ignore_non_printing: false,
             merge: false,
             reverse: false,
-            output_file: None,
             stable: false,
             unique: false,
             check: false,
             check_silent: false,
-            salt: String::new(),
+            salt: None,
             selectors: vec![],
             separator: None,
             threads: String::new(),
             zero_terminated: false,
             buffer_size: DEFAULT_BUF_SIZE,
-            tmp_dir: PathBuf::new(),
             compress_prog: None,
             merge_batch_size: 32,
+            precomputed: Precomputed {
+                num_infos_per_line: 0,
+                floats_per_line: 0,
+                selections_per_line: 0,
+                needs_tokens: false,
+            },
         }
     }
 }
+
 #[derive(Clone, PartialEq, Debug)]
 struct KeySettings {
     mode: SortMode,
@@ -322,32 +492,10 @@ impl Default for KeySettings {
         Self::from(&GlobalSettings::default())
     }
 }
-
-#[derive(Clone, Debug)]
-enum NumCache {
+enum Selection<'a> {
     AsF64(GeneralF64ParseResult),
-    WithInfo(NumInfo),
-}
-
-impl NumCache {
-    fn as_f64(&self) -> GeneralF64ParseResult {
-        match self {
-            NumCache::AsF64(n) => *n,
-            _ => unreachable!(),
-        }
-    }
-    fn as_num_info(&self) -> &NumInfo {
-        match self {
-            NumCache::WithInfo(n) => n,
-            _ => unreachable!(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct Selection<'a> {
-    slice: &'a str,
-    num_cache: Option<Box<NumCache>>,
+    WithNumInfo(&'a str, NumInfo),
+    Str(&'a str),
 }
 
 type Field = Range<usize>;
@@ -355,31 +503,44 @@ type Field = Range<usize>;
 #[derive(Clone, Debug)]
 pub struct Line<'a> {
     line: &'a str,
-    selections: Box<[Selection<'a>]>,
+    index: usize,
 }
 
 impl<'a> Line<'a> {
-    fn create(string: &'a str, settings: &GlobalSettings) -> Self {
-        let fields = if settings
+    /// Creates a new `Line`.
+    ///
+    /// If additional data is needed for sorting it is added to `line_data`.
+    /// `token_buffer` allows to reuse the allocation for tokens.
+    fn create(
+        line: &'a str,
+        index: usize,
+        line_data: &mut LineData<'a>,
+        token_buffer: &mut Vec<Field>,
+        settings: &GlobalSettings,
+    ) -> Self {
+        token_buffer.clear();
+        if settings.precomputed.needs_tokens {
+            tokenize(line, settings.separator, token_buffer);
+        }
+        for (selector, selection) in settings
             .selectors
             .iter()
-            .any(|selector| selector.needs_tokens)
+            .map(|selector| (selector, selector.get_selection(line, token_buffer)))
         {
-            // Only tokenize if we will need tokens.
-            Some(tokenize(string, settings.separator))
-        } else {
-            None
-        };
-
-        Line {
-            line: string,
-            selections: settings
-                .selectors
-                .iter()
-                .filter(|selector| !selector.is_default_selection)
-                .map(|selector| selector.get_selection(string, fields.as_deref()))
-                .collect(),
+            match selection {
+                Selection::AsF64(parsed_float) => line_data.parsed_floats.push(parsed_float),
+                Selection::WithNumInfo(str, num_info) => {
+                    line_data.num_infos.push(num_info);
+                    line_data.selections.push(str);
+                }
+                Selection::Str(str) => {
+                    if selector.needs_selection {
+                        line_data.selections.push(str)
+                    }
+                }
+            }
         }
+        Self { line, index }
     }
 
     fn print(&self, writer: &mut impl Write, settings: &GlobalSettings) {
@@ -408,7 +569,8 @@ impl<'a> Line<'a> {
         let line = self.line.replace('\t', ">");
         writeln!(writer, "{}", line)?;
 
-        let fields = tokenize(self.line, settings.separator);
+        let mut fields = vec![];
+        tokenize(self.line, settings.separator, &mut fields);
         for selector in settings.selectors.iter() {
             let mut selection = selector.get_range(self.line, Some(&fields));
             match selector.settings.mode {
@@ -497,18 +659,14 @@ impl<'a> Line<'a> {
                 " ".repeat(UnicodeWidthStr::width(&line[..selection.start]))
             )?;
 
-            // TODO: Once our minimum supported rust version is at least 1.47, use selection.is_empty() instead.
-            #[allow(clippy::len_zero)]
-            {
-                if selection.len() == 0 {
-                    writeln!(writer, "^ no match for key")?;
-                } else {
-                    writeln!(
-                        writer,
-                        "{}",
-                        "_".repeat(UnicodeWidthStr::width(&line[selection]))
-                    )?;
-                }
+            if selection.is_empty() {
+                writeln!(writer, "^ no match for key")?;
+            } else {
+                writeln!(
+                    writer,
+                    "{}",
+                    "_".repeat(UnicodeWidthStr::width(&line[selection]))
+                )?;
             }
         }
         if settings.mode != SortMode::Random
@@ -539,51 +697,51 @@ impl<'a> Line<'a> {
     }
 }
 
-/// Tokenize a line into fields.
-fn tokenize(line: &str, separator: Option<char>) -> Vec<Field> {
+/// Tokenize a line into fields. The result is stored into `token_buffer`.
+fn tokenize(line: &str, separator: Option<char>, token_buffer: &mut Vec<Field>) {
+    assert!(token_buffer.is_empty());
     if let Some(separator) = separator {
-        tokenize_with_separator(line, separator)
+        tokenize_with_separator(line, separator, token_buffer)
     } else {
-        tokenize_default(line)
+        tokenize_default(line, token_buffer)
     }
 }
 
 /// By default fields are separated by the first whitespace after non-whitespace.
 /// Whitespace is included in fields at the start.
-fn tokenize_default(line: &str) -> Vec<Field> {
-    let mut tokens = vec![0..0];
+/// The result is stored into `token_buffer`.
+fn tokenize_default(line: &str, token_buffer: &mut Vec<Field>) {
+    token_buffer.push(0..0);
     // pretend that there was whitespace in front of the line
     let mut previous_was_whitespace = true;
     for (idx, char) in line.char_indices() {
         if char.is_whitespace() {
             if !previous_was_whitespace {
-                tokens.last_mut().unwrap().end = idx;
-                tokens.push(idx..0);
+                token_buffer.last_mut().unwrap().end = idx;
+                token_buffer.push(idx..0);
             }
             previous_was_whitespace = true;
         } else {
             previous_was_whitespace = false;
         }
     }
-    tokens.last_mut().unwrap().end = line.len();
-    tokens
+    token_buffer.last_mut().unwrap().end = line.len();
 }
 
 /// Split between separators. These separators are not included in fields.
-fn tokenize_with_separator(line: &str, separator: char) -> Vec<Field> {
-    let mut tokens = vec![];
+/// The result is stored into `token_buffer`.
+fn tokenize_with_separator(line: &str, separator: char, token_buffer: &mut Vec<Field>) {
     let separator_indices =
         line.char_indices()
             .filter_map(|(i, c)| if c == separator { Some(i) } else { None });
     let mut start = 0;
     for sep_idx in separator_indices {
-        tokens.push(start..sep_idx);
+        token_buffer.push(start..sep_idx);
         start = sep_idx + 1;
     }
     if start < line.len() {
-        tokens.push(start..line.len());
+        token_buffer.push(start..line.len());
     }
-    tokens
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -601,19 +759,19 @@ impl KeyPosition {
 
         let field = field_and_char
             .next()
-            .ok_or_else(|| format!("invalid key `{}`", key))?;
+            .ok_or_else(|| format!("invalid key {}", key.quote()))?;
         let char = field_and_char.next();
 
         let field = field
             .parse()
-            .map_err(|e| format!("failed to parse field index `{}`: {}", field, e))?;
+            .map_err(|e| format!("failed to parse field index {}: {}", field.quote(), e))?;
         if field == 0 {
             return Err("field index can not be 0".to_string());
         }
 
         let char = char.map_or(Ok(default_char_index), |char| {
             char.parse()
-                .map_err(|e| format!("failed to parse character index `{}`: {}", char, e))
+                .map_err(|e| format!("failed to parse character index {}: {}", char.quote(), e))
         })?;
 
         Ok(Self {
@@ -634,26 +792,16 @@ impl Default for KeyPosition {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Default)]
 struct FieldSelector {
     from: KeyPosition,
     to: Option<KeyPosition>,
     settings: KeySettings,
     needs_tokens: bool,
-    // Whether the selection for each line is going to be the whole line with no NumCache
-    is_default_selection: bool,
-}
-
-impl Default for FieldSelector {
-    fn default() -> Self {
-        Self {
-            from: Default::default(),
-            to: None,
-            settings: Default::default(),
-            needs_tokens: false,
-            is_default_selection: true,
-        }
-    }
+    // Whether this selector operates on a sub-slice of a line.
+    // Selections are therefore not needed when this selector matches the whole line
+    // or the sort mode is general-numeric.
+    needs_selection: bool,
 }
 
 impl FieldSelector {
@@ -666,33 +814,37 @@ impl FieldSelector {
         }
     }
 
-    fn parse(key: &str, global_settings: &GlobalSettings) -> Self {
+    fn parse(key: &str, global_settings: &GlobalSettings) -> UResult<Self> {
         let mut from_to = key.split(',');
         let (from, from_options) = Self::split_key_options(from_to.next().unwrap());
-        let to = from_to.next().map(|to| Self::split_key_options(to));
+        let to = from_to.next().map(Self::split_key_options);
         let options_are_empty = from_options.is_empty() && matches!(to, None | Some((_, "")));
-        crash_if_err!(
-            2,
-            if options_are_empty {
-                // Inherit the global settings if there are no options attached to this key.
-                (|| {
-                    // This would be ideal for a try block, I think. In the meantime this closure allows
-                    // to use the `?` operator here.
-                    Self::new(
-                        KeyPosition::new(from, 1, global_settings.ignore_leading_blanks)?,
-                        to.map(|(to, _)| {
-                            KeyPosition::new(to, 0, global_settings.ignore_leading_blanks)
-                        })
-                        .transpose()?,
-                        KeySettings::from(global_settings),
-                    )
-                })()
-            } else {
-                // Do not inherit from `global_settings`, as there are options attached to this key.
-                Self::parse_with_options((from, from_options), to)
+
+        if options_are_empty {
+            // Inherit the global settings if there are no options attached to this key.
+            (|| {
+                // This would be ideal for a try block, I think. In the meantime this closure allows
+                // to use the `?` operator here.
+                Self::new(
+                    KeyPosition::new(from, 1, global_settings.ignore_leading_blanks)?,
+                    to.map(|(to, _)| {
+                        KeyPosition::new(to, 0, global_settings.ignore_leading_blanks)
+                    })
+                    .transpose()?,
+                    KeySettings::from(global_settings),
+                )
+            })()
+        } else {
+            // Do not inherit from `global_settings`, as there are options attached to this key.
+            Self::parse_with_options((from, from_options), to)
+        }
+        .map_err(|msg| {
+            SortError::ParseKeyError {
+                key: key.to_owned(),
+                msg,
             }
-            .map_err(|e| format!("failed to parse key `{}`: {}", key, e))
-        )
+            .into()
+        })
     }
 
     fn parse_with_options(
@@ -718,7 +870,7 @@ impl FieldSelector {
                     'R' => key_settings.set_sort_mode(SortMode::Random)?,
                     'r' => key_settings.reverse = true,
                     'V' => key_settings.set_sort_mode(SortMode::Version)?,
-                    c => return Err(format!("invalid option: `{}`", c)),
+                    c => return Err(format!("invalid option: '{}'", c)),
                 }
             }
             Ok(ignore_blanks)
@@ -747,14 +899,12 @@ impl FieldSelector {
             Err("invalid character index 0 for the start position of a field".to_string())
         } else {
             Ok(Self {
-                is_default_selection: from.field == 1
-                    && from.char == 1
-                    && to.is_none()
-                    && !matches!(
-                        settings.mode,
-                        SortMode::Numeric | SortMode::GeneralNumeric | SortMode::HumanNumeric
-                    )
-                    && !from.ignore_blanks,
+                needs_selection: (from.field != 1
+                    || from.char != 1
+                    || to.is_some()
+                    || matches!(settings.mode, SortMode::Numeric | SortMode::HumanNumeric)
+                    || from.ignore_blanks)
+                    && !matches!(settings.mode, SortMode::GeneralNumeric),
                 needs_tokens: from.field != 1 || from.char == 0 || to.is_some(),
                 from,
                 to,
@@ -764,12 +914,16 @@ impl FieldSelector {
     }
 
     /// Get the selection that corresponds to this selector for the line.
-    /// If needs_fields returned false, tokens may be None.
-    fn get_selection<'a>(&self, line: &'a str, tokens: Option<&[Field]>) -> Selection<'a> {
+    /// If needs_fields returned false, tokens may be empty.
+    fn get_selection<'a>(&self, line: &'a str, tokens: &[Field]) -> Selection<'a> {
+        // `get_range` expects `None` when we don't need tokens and would get confused by an empty vector.
+        let tokens = if self.needs_tokens {
+            Some(tokens)
+        } else {
+            None
+        };
         let mut range = &line[self.get_range(line, tokens)];
-        let num_cache = if self.settings.mode == SortMode::Numeric
-            || self.settings.mode == SortMode::HumanNumeric
-        {
+        if self.settings.mode == SortMode::Numeric || self.settings.mode == SortMode::HumanNumeric {
             // Parse NumInfo for this number.
             let (info, num_range) = NumInfo::parse(
                 range,
@@ -780,24 +934,18 @@ impl FieldSelector {
             );
             // Shorten the range to what we need to pass to numeric_str_cmp later.
             range = &range[num_range];
-            Some(Box::new(NumCache::WithInfo(info)))
+            Selection::WithNumInfo(range, info)
         } else if self.settings.mode == SortMode::GeneralNumeric {
             // Parse this number as f64, as this is the requirement for general numeric sorting.
-            Some(Box::new(NumCache::AsF64(general_f64_parse(
-                &range[get_leading_gen(range)],
-            ))))
+            Selection::AsF64(general_f64_parse(&range[get_leading_gen(range)]))
         } else {
             // This is not a numeric sort, so we don't need a NumCache.
-            None
-        };
-        Selection {
-            slice: range,
-            num_cache,
+            Selection::Str(range)
         }
     }
 
     /// Look up the range in the line that corresponds to this selector.
-    /// If needs_fields returned false, tokens may be None.
+    /// If needs_fields returned false, tokens must be None.
     fn get_range<'a>(&self, line: &'a str, tokens: Option<&[Field]>) -> Range<usize> {
         enum Resolution {
             // The start index of the resolved character, inclusive
@@ -887,15 +1035,13 @@ impl FieldSelector {
     }
 }
 
-fn get_usage() -> String {
+fn usage() -> String {
     format!(
-        "{0}
-Usage:
- {0} [OPTION]... [FILE]...
+        "{0} [OPTION]... [FILE]...
 Write the sorted concatenation of all FILE(s) to standard output.
 Mandatory arguments for long options are mandatory for short options too.
 With no FILE, or when FILE is -, read standard input.",
-        NAME
+        uucore::execution_phrase()
     )
 }
 
@@ -910,88 +1056,285 @@ fn make_sort_mode_arg<'a, 'b>(mode: &'a str, short: &'b str, help: &'b str) -> A
     arg
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
-    let usage = get_usage();
+    let usage = usage();
     let mut settings: GlobalSettings = Default::default();
 
-    let matches = App::new(executable!())
+    let matches = match uu_app().usage(&usage[..]).get_matches_from_safe(args) {
+        Ok(t) => t,
+        Err(e) => {
+            // not all clap "Errors" are because of a failure to parse arguments.
+            // "--version" also causes an Error to be returned, but we should not print to stderr
+            // nor return with a non-zero exit code in this case (we should print to stdout and return 0).
+            // This logic is similar to the code in clap, but we return 2 as the exit code in case of real failure
+            // (clap returns 1).
+            if e.use_stderr() {
+                eprintln!("{}", e.message);
+                set_exit_code(2);
+            } else {
+                println!("{}", e.message);
+            }
+            return Ok(());
+        }
+    };
+
+    settings.debug = matches.is_present(options::DEBUG);
+
+    // check whether user specified a zero terminated list of files for input, otherwise read files from args
+    let mut files: Vec<OsString> = if matches.is_present(options::FILES0_FROM) {
+        let files0_from: Vec<OsString> = matches
+            .values_of_os(options::FILES0_FROM)
+            .map(|v| v.map(ToOwned::to_owned).collect())
+            .unwrap_or_default();
+
+        let mut files = Vec::new();
+        for path in &files0_from {
+            let reader = open(&path)?;
+            let buf_reader = BufReader::new(reader);
+            for line in buf_reader.split(b'\0').flatten() {
+                files.push(OsString::from(
+                    std::str::from_utf8(&line)
+                        .expect("Could not parse string from zero terminated input."),
+                ));
+            }
+        }
+        files
+    } else {
+        matches
+            .values_of_os(options::FILES)
+            .map(|v| v.map(ToOwned::to_owned).collect())
+            .unwrap_or_default()
+    };
+
+    settings.mode = if matches.is_present(options::modes::HUMAN_NUMERIC)
+        || matches.value_of(options::modes::SORT) == Some("human-numeric")
+    {
+        SortMode::HumanNumeric
+    } else if matches.is_present(options::modes::MONTH)
+        || matches.value_of(options::modes::SORT) == Some("month")
+    {
+        SortMode::Month
+    } else if matches.is_present(options::modes::GENERAL_NUMERIC)
+        || matches.value_of(options::modes::SORT) == Some("general-numeric")
+    {
+        SortMode::GeneralNumeric
+    } else if matches.is_present(options::modes::NUMERIC)
+        || matches.value_of(options::modes::SORT) == Some("numeric")
+    {
+        SortMode::Numeric
+    } else if matches.is_present(options::modes::VERSION)
+        || matches.value_of(options::modes::SORT) == Some("version")
+    {
+        SortMode::Version
+    } else if matches.is_present(options::modes::RANDOM)
+        || matches.value_of(options::modes::SORT) == Some("random")
+    {
+        settings.salt = Some(get_rand_string());
+        SortMode::Random
+    } else {
+        SortMode::Default
+    };
+
+    settings.dictionary_order = matches.is_present(options::DICTIONARY_ORDER);
+    settings.ignore_non_printing = matches.is_present(options::IGNORE_NONPRINTING);
+    if matches.is_present(options::PARALLEL) {
+        // "0" is default - threads = num of cores
+        settings.threads = matches
+            .value_of(options::PARALLEL)
+            .map(String::from)
+            .unwrap_or_else(|| "0".to_string());
+        env::set_var("RAYON_NUM_THREADS", &settings.threads);
+    }
+
+    settings.buffer_size =
+        matches
+            .value_of(options::BUF_SIZE)
+            .map_or(Ok(DEFAULT_BUF_SIZE), |s| {
+                GlobalSettings::parse_byte_count(s).map_err(|e| {
+                    USimpleError::new(2, format_error_message(e, s, options::BUF_SIZE))
+                })
+            })?;
+
+    let mut tmp_dir = TmpDirWrapper::new(
+        matches
+            .value_of(options::TMP_DIR)
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir),
+    );
+
+    settings.compress_prog = matches.value_of(options::COMPRESS_PROG).map(String::from);
+
+    if let Some(n_merge) = matches.value_of(options::BATCH_SIZE) {
+        settings.merge_batch_size = n_merge.parse().map_err(|_| {
+            UUsageError::new(
+                2,
+                format!("invalid --batch-size argument {}", n_merge.quote()),
+            )
+        })?;
+    }
+
+    settings.zero_terminated = matches.is_present(options::ZERO_TERMINATED);
+    settings.merge = matches.is_present(options::MERGE);
+
+    settings.check = matches.is_present(options::check::CHECK);
+    if matches.is_present(options::check::CHECK_SILENT)
+        || matches!(
+            matches.value_of(options::check::CHECK),
+            Some(options::check::SILENT) | Some(options::check::QUIET)
+        )
+    {
+        settings.check_silent = true;
+        settings.check = true;
+    };
+
+    settings.ignore_case = matches.is_present(options::IGNORE_CASE);
+
+    settings.ignore_leading_blanks = matches.is_present(options::IGNORE_LEADING_BLANKS);
+
+    settings.reverse = matches.is_present(options::REVERSE);
+    settings.stable = matches.is_present(options::STABLE);
+    settings.unique = matches.is_present(options::UNIQUE);
+
+    if files.is_empty() {
+        /* if no file, default to stdin */
+        files.push("-".to_string().into());
+    } else if settings.check && files.len() != 1 {
+        return Err(UUsageError::new(
+            2,
+            format!("extra operand {} not allowed with -c", files[1].quote()),
+        ));
+    }
+
+    if let Some(arg) = matches.args.get(options::SEPARATOR) {
+        let mut separator = arg.vals[0].to_str().ok_or_else(|| {
+            UUsageError::new(
+                2,
+                format!("separator is not valid unicode: {}", arg.vals[0].quote()),
+            )
+        })?;
+        if separator == "\\0" {
+            separator = "\0";
+        }
+        // This rejects non-ASCII codepoints, but perhaps we don't have to.
+        // On the other hand GNU accepts any single byte, valid unicode or not.
+        // (Supporting multi-byte chars would require changes in tokenize_with_separator().)
+        if separator.len() != 1 {
+            return Err(UUsageError::new(
+                2,
+                format!(
+                    "separator must be exactly one character long: {}",
+                    separator.quote()
+                ),
+            ));
+        }
+        settings.separator = Some(separator.chars().next().unwrap())
+    }
+
+    if let Some(values) = matches.values_of(options::KEY) {
+        for value in values {
+            let selector = FieldSelector::parse(value, &settings)?;
+            if selector.settings.mode == SortMode::Random && settings.salt.is_none() {
+                settings.salt = Some(get_rand_string());
+            }
+            settings.selectors.push(selector);
+        }
+    }
+
+    if !matches.is_present(options::KEY) {
+        // add a default selector matching the whole line
+        let key_settings = KeySettings::from(&settings);
+        settings.selectors.push(
+            FieldSelector::new(
+                KeyPosition {
+                    field: 1,
+                    char: 1,
+                    ignore_blanks: key_settings.ignore_blanks,
+                },
+                None,
+                key_settings,
+            )
+            .unwrap(),
+        );
+    }
+
+    // Verify that we can open all input files.
+    // It is the correct behavior to close all files afterwards,
+    // and to reopen them at a later point. This is different from how the output file is handled,
+    // probably to prevent running out of file descriptors.
+    for file in &files {
+        open(file)?;
+    }
+
+    let output = Output::new(matches.value_of(options::OUTPUT))?;
+
+    settings.init_precomputed();
+
+    exec(&mut files, &settings, output, &mut tmp_dir)
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
         .arg(
             Arg::with_name(options::modes::SORT)
                 .long(options::modes::SORT)
                 .takes_value(true)
-                .possible_values(
-                    &[
-                        "general-numeric",
-                        "human-numeric",
-                        "month",
-                        "numeric",
-                        "version",
-                        "random",
-                    ]
-                )
-                .conflicts_with_all(&options::modes::ALL_SORT_MODES)
+                .possible_values(&[
+                    "general-numeric",
+                    "human-numeric",
+                    "month",
+                    "numeric",
+                    "version",
+                    "random",
+                ])
+                .conflicts_with_all(&options::modes::ALL_SORT_MODES),
         )
-        .arg(
-            make_sort_mode_arg(
-                options::modes::HUMAN_NUMERIC,
-                "h",
-                "compare according to human readable sizes, eg 1M > 100k"
-            ),
-        )
-        .arg(
-            make_sort_mode_arg(
-                options::modes::MONTH,
-                "M",
-                "compare according to month name abbreviation"
-            ),
-        )
-        .arg(
-            make_sort_mode_arg(
-                options::modes::NUMERIC,
-                "n",
-                "compare according to string numerical value"
-            ),
-        )
-        .arg(
-            make_sort_mode_arg(
-                options::modes::GENERAL_NUMERIC,
-                "g",
-                "compare according to string general numerical value"
-            ),
-        )
-        .arg(
-            make_sort_mode_arg(
-                options::modes::VERSION,
-                "V",
-                "Sort by SemVer version number, eg 1.12.2 > 1.1.2",
-            ),
-        )
-        .arg(
-            make_sort_mode_arg(
-                options::modes::RANDOM,
-                "R",
-                "shuffle in random order",
-            ),
-        )
+        .arg(make_sort_mode_arg(
+            options::modes::HUMAN_NUMERIC,
+            "h",
+            "compare according to human readable sizes, eg 1M > 100k",
+        ))
+        .arg(make_sort_mode_arg(
+            options::modes::MONTH,
+            "M",
+            "compare according to month name abbreviation",
+        ))
+        .arg(make_sort_mode_arg(
+            options::modes::NUMERIC,
+            "n",
+            "compare according to string numerical value",
+        ))
+        .arg(make_sort_mode_arg(
+            options::modes::GENERAL_NUMERIC,
+            "g",
+            "compare according to string general numerical value",
+        ))
+        .arg(make_sort_mode_arg(
+            options::modes::VERSION,
+            "V",
+            "Sort by SemVer version number, eg 1.12.2 > 1.1.2",
+        ))
+        .arg(make_sort_mode_arg(
+            options::modes::RANDOM,
+            "R",
+            "shuffle in random order",
+        ))
         .arg(
             Arg::with_name(options::DICTIONARY_ORDER)
                 .short("d")
                 .long(options::DICTIONARY_ORDER)
                 .help("consider only blanks and alphanumeric characters")
-                .conflicts_with_all(
-                    &[
-                        options::modes::NUMERIC,
-                        options::modes::GENERAL_NUMERIC,
-                        options::modes::HUMAN_NUMERIC,
-                        options::modes::MONTH,
-                    ]
-                ),
+                .conflicts_with_all(&[
+                    options::modes::NUMERIC,
+                    options::modes::GENERAL_NUMERIC,
+                    options::modes::HUMAN_NUMERIC,
+                    options::modes::MONTH,
+                ]),
         )
         .arg(
             Arg::with_name(options::MERGE)
@@ -1011,13 +1354,18 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                     options::check::QUIET,
                     options::check::DIAGNOSE_FIRST,
                 ])
+                .conflicts_with(options::OUTPUT)
                 .help("check for sorted input; do not sort"),
         )
         .arg(
             Arg::with_name(options::check::CHECK_SILENT)
                 .short("C")
                 .long(options::check::CHECK_SILENT)
-                .help("exit successfully if the given file is already sorted, and exit with status 1 otherwise."),
+                .conflicts_with(options::OUTPUT)
+                .help(
+                    "exit successfully if the given file is already sorted,\
+                and exit with status 1 otherwise.",
+                ),
         )
         .arg(
             Arg::with_name(options::IGNORE_CASE)
@@ -1030,14 +1378,12 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .short("i")
                 .long(options::IGNORE_NONPRINTING)
                 .help("ignore nonprinting characters")
-                .conflicts_with_all(
-                    &[
-                        options::modes::NUMERIC,
-                        options::modes::GENERAL_NUMERIC,
-                        options::modes::HUMAN_NUMERIC,
-                        options::modes::MONTH
-                    ]
-                ),
+                .conflicts_with_all(&[
+                    options::modes::NUMERIC,
+                    options::modes::GENERAL_NUMERIC,
+                    options::modes::HUMAN_NUMERIC,
+                    options::modes::MONTH,
+                ]),
         )
         .arg(
             Arg::with_name(options::IGNORE_LEADING_BLANKS)
@@ -1078,6 +1424,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .help("sort by a key")
                 .long_help(LONG_HELP_KEYS)
                 .multiple(true)
+                .number_of_values(1)
                 .takes_value(true),
         )
         .arg(
@@ -1085,7 +1432,8 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .short("t")
                 .long(options::SEPARATOR)
                 .help("custom separator for -k")
-                .takes_value(true))
+                .takes_value(true),
+        )
         .arg(
             Arg::with_name(options::ZERO_TERMINATED)
                 .short("z")
@@ -1120,13 +1468,13 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .long(options::COMPRESS_PROG)
                 .help("compress temporary files with PROG, decompress with PROG -d")
                 .long_help("PROG has to take input from stdin and output to stdout")
-                .value_name("PROG")
+                .value_name("PROG"),
         )
         .arg(
             Arg::with_name(options::BATCH_SIZE)
                 .long(options::BATCH_SIZE)
                 .help("Merge at most N_MERGE inputs at once.")
-                .value_name("N_MERGE")
+                .value_name("N_MERGE"),
         )
         .arg(
             Arg::with_name(options::FILES0_FROM)
@@ -1141,244 +1489,112 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .long(options::DEBUG)
                 .help("underline the parts of the line that are actually used for sorting"),
         )
-        .arg(Arg::with_name(options::FILES).multiple(true).takes_value(true))
-        .get_matches_from(args);
-
-    settings.debug = matches.is_present(options::DEBUG);
-
-    // check whether user specified a zero terminated list of files for input, otherwise read files from args
-    let mut files: Vec<String> = if matches.is_present(options::FILES0_FROM) {
-        let files0_from: Vec<String> = matches
-            .values_of(options::FILES0_FROM)
-            .map(|v| v.map(ToString::to_string).collect())
-            .unwrap_or_default();
-
-        let mut files = Vec::new();
-        for path in &files0_from {
-            let reader = open(path.as_str());
-            let buf_reader = BufReader::new(reader);
-            for line in buf_reader.split(b'\0').flatten() {
-                files.push(
-                    std::str::from_utf8(&line)
-                        .expect("Could not parse string from zero terminated input.")
-                        .to_string(),
-                );
-            }
-        }
-        files
-    } else {
-        matches
-            .values_of(options::FILES)
-            .map(|v| v.map(ToString::to_string).collect())
-            .unwrap_or_default()
-    };
-
-    settings.mode = if matches.is_present(options::modes::HUMAN_NUMERIC)
-        || matches.value_of(options::modes::SORT) == Some("human-numeric")
-    {
-        SortMode::HumanNumeric
-    } else if matches.is_present(options::modes::MONTH)
-        || matches.value_of(options::modes::SORT) == Some("month")
-    {
-        SortMode::Month
-    } else if matches.is_present(options::modes::GENERAL_NUMERIC)
-        || matches.value_of(options::modes::SORT) == Some("general-numeric")
-    {
-        SortMode::GeneralNumeric
-    } else if matches.is_present(options::modes::NUMERIC)
-        || matches.value_of(options::modes::SORT) == Some("numeric")
-    {
-        SortMode::Numeric
-    } else if matches.is_present(options::modes::VERSION)
-        || matches.value_of(options::modes::SORT) == Some("version")
-    {
-        SortMode::Version
-    } else if matches.is_present(options::modes::RANDOM)
-        || matches.value_of(options::modes::SORT) == Some("random")
-    {
-        settings.salt = get_rand_string();
-        SortMode::Random
-    } else {
-        SortMode::Default
-    };
-
-    settings.dictionary_order = matches.is_present(options::DICTIONARY_ORDER);
-    settings.ignore_non_printing = matches.is_present(options::IGNORE_NONPRINTING);
-    if matches.is_present(options::PARALLEL) {
-        // "0" is default - threads = num of cores
-        settings.threads = matches
-            .value_of(options::PARALLEL)
-            .map(String::from)
-            .unwrap_or_else(|| "0".to_string());
-        env::set_var("RAYON_NUM_THREADS", &settings.threads);
-    }
-
-    settings.buffer_size = matches
-        .value_of(options::BUF_SIZE)
-        .map_or(DEFAULT_BUF_SIZE, |s| {
-            GlobalSettings::parse_byte_count(s)
-                .unwrap_or_else(|e| crash!(2, "{}", format_error_message(e, s, options::BUF_SIZE)))
-        });
-
-    settings.tmp_dir = matches
-        .value_of(options::TMP_DIR)
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
-
-    settings.compress_prog = matches.value_of(options::COMPRESS_PROG).map(String::from);
-
-    if let Some(n_merge) = matches.value_of(options::BATCH_SIZE) {
-        settings.merge_batch_size = n_merge
-            .parse()
-            .unwrap_or_else(|_| crash!(2, "invalid --batch-size argument '{}'", n_merge));
-    }
-
-    settings.zero_terminated = matches.is_present(options::ZERO_TERMINATED);
-    settings.merge = matches.is_present(options::MERGE);
-
-    settings.check = matches.is_present(options::check::CHECK);
-    if matches.is_present(options::check::CHECK_SILENT)
-        || matches!(
-            matches.value_of(options::check::CHECK),
-            Some(options::check::SILENT) | Some(options::check::QUIET)
+        .arg(
+            Arg::with_name(options::FILES)
+                .multiple(true)
+                .takes_value(true),
         )
-    {
-        settings.check_silent = true;
-        settings.check = true;
-    };
-
-    settings.ignore_case = matches.is_present(options::IGNORE_CASE);
-
-    settings.ignore_leading_blanks = matches.is_present(options::IGNORE_LEADING_BLANKS);
-
-    settings.output_file = matches.value_of(options::OUTPUT).map(String::from);
-    settings.reverse = matches.is_present(options::REVERSE);
-    settings.stable = matches.is_present(options::STABLE);
-    settings.unique = matches.is_present(options::UNIQUE);
-
-    if files.is_empty() {
-        /* if no file, default to stdin */
-        files.push("-".to_owned());
-    } else if settings.check && files.len() != 1 {
-        crash!(1, "extra operand `{}' not allowed with -c", files[1])
-    }
-
-    if let Some(arg) = matches.args.get(options::SEPARATOR) {
-        let separator = arg.vals[0].to_string_lossy();
-        let separator = separator;
-        if separator.len() != 1 {
-            crash!(1, "separator must be exactly one character long");
-        }
-        settings.separator = Some(separator.chars().next().unwrap())
-    }
-
-    if let Some(values) = matches.values_of(options::KEY) {
-        for value in values {
-            settings
-                .selectors
-                .push(FieldSelector::parse(value, &settings));
-        }
-    }
-
-    if !matches.is_present(options::KEY) {
-        // add a default selector matching the whole line
-        let key_settings = KeySettings::from(&settings);
-        settings.selectors.push(
-            FieldSelector::new(
-                KeyPosition {
-                    field: 1,
-                    char: 1,
-                    ignore_blanks: key_settings.ignore_blanks,
-                },
-                None,
-                key_settings,
-            )
-            .unwrap(),
-        );
-    }
-
-    exec(&files, &settings)
 }
 
-fn output_sorted_lines<'a>(iter: impl Iterator<Item = &'a Line<'a>>, settings: &GlobalSettings) {
-    if settings.unique {
-        print_sorted(
-            iter.dedup_by(|a, b| compare_by(a, b, settings) == Ordering::Equal),
-            settings,
-        );
-    } else {
-        print_sorted(iter, settings);
-    }
-}
-
-fn exec(files: &[String], settings: &GlobalSettings) -> i32 {
+fn exec(
+    files: &mut [OsString],
+    settings: &GlobalSettings,
+    output: Output,
+    tmp_dir: &mut TmpDirWrapper,
+) -> UResult<()> {
     if settings.merge {
-        let mut file_merger = merge::merge(files.iter().map(open), settings);
-        file_merger.write_all(settings);
+        let file_merger = merge::merge(files, settings, output.as_output_name(), tmp_dir)?;
+        file_merger.write_all(settings, output)
     } else if settings.check {
         if files.len() > 1 {
-            crash!(1, "only one file allowed with -c");
+            Err(UUsageError::new(2, "only one file allowed with -c"))
+        } else {
+            check::check(files.first().unwrap(), settings)
         }
-        return check::check(files.first().unwrap(), settings);
     } else {
         let mut lines = files.iter().map(open);
-
-        ext_sort(&mut lines, settings);
+        ext_sort(&mut lines, settings, output, tmp_dir)
     }
-    0
 }
 
-fn sort_by<'a>(unsorted: &mut Vec<Line<'a>>, settings: &GlobalSettings) {
+fn sort_by<'a>(unsorted: &mut Vec<Line<'a>>, settings: &GlobalSettings, line_data: &LineData<'a>) {
     if settings.stable || settings.unique {
-        unsorted.par_sort_by(|a, b| compare_by(a, b, settings))
+        unsorted.par_sort_by(|a, b| compare_by(a, b, settings, line_data, line_data))
     } else {
-        unsorted.par_sort_unstable_by(|a, b| compare_by(a, b, settings))
+        unsorted.par_sort_unstable_by(|a, b| compare_by(a, b, settings, line_data, line_data))
     }
 }
 
-fn compare_by<'a>(a: &Line<'a>, b: &Line<'a>, global_settings: &GlobalSettings) -> Ordering {
-    let mut idx = 0;
+fn compare_by<'a>(
+    a: &Line<'a>,
+    b: &Line<'a>,
+    global_settings: &GlobalSettings,
+    a_line_data: &LineData<'a>,
+    b_line_data: &LineData<'a>,
+) -> Ordering {
+    let mut selection_index = 0;
+    let mut num_info_index = 0;
+    let mut parsed_float_index = 0;
     for selector in &global_settings.selectors {
-        let mut _selections = None;
-        let (a_selection, b_selection) = if selector.is_default_selection {
+        let (a_str, b_str) = if !selector.needs_selection {
             // We can select the whole line.
-            // We have to store the selections outside of the if-block so that they live long enough.
-            _selections = Some((
-                Selection {
-                    slice: a.line,
-                    num_cache: None,
-                },
-                Selection {
-                    slice: b.line,
-                    num_cache: None,
-                },
-            ));
-            // Unwrap the selections again, and return references to them.
-            (
-                &_selections.as_ref().unwrap().0,
-                &_selections.as_ref().unwrap().1,
-            )
+            (a.line, b.line)
         } else {
-            let selections = (&a.selections[idx], &b.selections[idx]);
-            idx += 1;
+            let selections = (
+                a_line_data.selections
+                    [a.index * global_settings.precomputed.selections_per_line + selection_index],
+                b_line_data.selections
+                    [b.index * global_settings.precomputed.selections_per_line + selection_index],
+            );
+            selection_index += 1;
             selections
         };
-        let a_str = a_selection.slice;
-        let b_str = b_selection.slice;
+
         let settings = &selector.settings;
 
         let cmp: Ordering = match settings.mode {
-            SortMode::Random => random_shuffle(a_str, b_str, &global_settings.salt),
-            SortMode::Numeric | SortMode::HumanNumeric => numeric_str_cmp(
-                (a_str, a_selection.num_cache.as_ref().unwrap().as_num_info()),
-                (b_str, b_selection.num_cache.as_ref().unwrap().as_num_info()),
-            ),
-            SortMode::GeneralNumeric => general_numeric_compare(
-                a_selection.num_cache.as_ref().unwrap().as_f64(),
-                b_selection.num_cache.as_ref().unwrap().as_f64(),
-            ),
+            SortMode::Random => {
+                // check if the two strings are equal
+                if custom_str_cmp(
+                    a_str,
+                    b_str,
+                    settings.ignore_non_printing,
+                    settings.dictionary_order,
+                    settings.ignore_case,
+                ) == Ordering::Equal
+                {
+                    Ordering::Equal
+                } else {
+                    // Only if they are not equal compare by the hash
+                    random_shuffle(a_str, b_str, &global_settings.salt.unwrap())
+                }
+            }
+            SortMode::Numeric => {
+                let a_num_info = &a_line_data.num_infos
+                    [a.index * global_settings.precomputed.num_infos_per_line + num_info_index];
+                let b_num_info = &b_line_data.num_infos
+                    [b.index * global_settings.precomputed.num_infos_per_line + num_info_index];
+                num_info_index += 1;
+                numeric_str_cmp((a_str, a_num_info), (b_str, b_num_info))
+            }
+            SortMode::HumanNumeric => {
+                let a_num_info = &a_line_data.num_infos
+                    [a.index * global_settings.precomputed.num_infos_per_line + num_info_index];
+                let b_num_info = &b_line_data.num_infos
+                    [b.index * global_settings.precomputed.num_infos_per_line + num_info_index];
+                num_info_index += 1;
+                human_numeric_str_cmp((a_str, a_num_info), (b_str, b_num_info))
+            }
+            SortMode::GeneralNumeric => {
+                let a_float = &a_line_data.parsed_floats
+                    [a.index * global_settings.precomputed.floats_per_line + parsed_float_index];
+                let b_float = &b_line_data.parsed_floats
+                    [b.index * global_settings.precomputed.floats_per_line + parsed_float_index];
+                parsed_float_index += 1;
+                general_numeric_compare(a_float, b_float)
+            }
             SortMode::Month => month_compare(a_str, b_str),
-            SortMode::Version => version_compare(a_str, b_str),
+            SortMode::Version => version_cmp(a_str, b_str),
             SortMode::Default => custom_str_cmp(
                 a_str,
                 b_str,
@@ -1470,7 +1686,7 @@ fn get_leading_gen(input: &str) -> Range<usize> {
 }
 
 #[derive(Copy, Clone, PartialEq, PartialOrd, Debug)]
-enum GeneralF64ParseResult {
+pub enum GeneralF64ParseResult {
     Invalid,
     NaN,
     NegInfinity,
@@ -1497,16 +1713,12 @@ fn general_f64_parse(a: &str) -> GeneralF64ParseResult {
 /// Compares two floats, with errors and non-numerics assumed to be -inf.
 /// Stops coercing at the first non-numeric char.
 /// We explicitly need to convert to f64 in this case.
-fn general_numeric_compare(a: GeneralF64ParseResult, b: GeneralF64ParseResult) -> Ordering {
-    a.partial_cmp(&b).unwrap()
+fn general_numeric_compare(a: &GeneralF64ParseResult, b: &GeneralF64ParseResult) -> Ordering {
+    a.partial_cmp(b).unwrap()
 }
 
-fn get_rand_string() -> String {
-    thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(16)
-        .map(char::from)
-        .collect::<String>()
+fn get_rand_string() -> [u8; 16] {
+    thread_rng().sample(rand::distributions::Standard)
 }
 
 fn get_hash<T: Hash>(t: &T) -> u64 {
@@ -1515,10 +1727,9 @@ fn get_hash<T: Hash>(t: &T) -> u64 {
     s.finish()
 }
 
-fn random_shuffle(a: &str, b: &str, salt: &str) -> Ordering {
-    let da = get_hash(&[a, salt].concat());
-    let db = get_hash(&[b, salt].concat());
-
+fn random_shuffle(a: &str, b: &str, salt: &[u8]) -> Ordering {
+    let da = get_hash(&(a, salt));
+    let db = get_hash(&(b, salt));
     da.cmp(&db)
 }
 
@@ -1583,51 +1794,33 @@ fn month_compare(a: &str, b: &str) -> Ordering {
     }
 }
 
-fn version_parse(a: &str) -> Version {
-    let result = Version::parse(a);
-
-    match result {
-        Ok(vers_a) => vers_a,
-        // Non-version lines parse to 0.0.0
-        Err(_e) => Version::parse("0.0.0").unwrap(),
-    }
-}
-
-fn version_compare(a: &str, b: &str) -> Ordering {
-    #![allow(clippy::comparison_chain)]
-    let ver_a = version_parse(a);
-    let ver_b = version_parse(b);
-
-    // Version::cmp is not implemented; implement comparison directly
-    if ver_a > ver_b {
-        Ordering::Greater
-    } else if ver_a < ver_b {
-        Ordering::Less
-    } else {
-        Ordering::Equal
-    }
-}
-
-fn print_sorted<'a, T: Iterator<Item = &'a Line<'a>>>(iter: T, settings: &GlobalSettings) {
-    let mut writer = settings.out_writer();
+fn print_sorted<'a, T: Iterator<Item = &'a Line<'a>>>(
+    iter: T,
+    settings: &GlobalSettings,
+    output: Output,
+) {
+    let mut writer = output.into_write();
     for line in iter {
         line.print(&mut writer, settings);
     }
 }
 
-// from cat.rs
-fn open(path: impl AsRef<OsStr>) -> Box<dyn Read + Send> {
+fn open(path: impl AsRef<OsStr>) -> UResult<Box<dyn Read + Send>> {
     let path = path.as_ref();
     if path == "-" {
         let stdin = stdin();
-        return Box::new(stdin) as Box<dyn Read + Send>;
+        return Ok(Box::new(stdin) as Box<dyn Read + Send>);
     }
 
-    match File::open(Path::new(path)) {
-        Ok(f) => Box::new(f) as Box<dyn Read + Send>,
-        Err(e) => {
-            crash!(2, "cannot read: {0:?}: {1}", path, e);
+    let path = Path::new(path);
+
+    match File::open(path) {
+        Ok(f) => Ok(Box::new(f) as Box<dyn Read + Send>),
+        Err(error) => Err(SortError::ReadFailed {
+            path: path.to_owned(),
+            error,
         }
+        .into()),
     }
 }
 
@@ -1636,8 +1829,8 @@ fn format_error_message(error: ParseSizeError, s: &str, option: &str) -> String 
     // GNU's sort echos affected flag, -S or --buffer-size, depending user's selection
     // GNU's sort does distinguish between "invalid (suffix in) argument"
     match error {
-        ParseSizeError::ParseFailure(_) => format!("invalid --{} argument '{}'", option, s),
-        ParseSizeError::SizeTooBig(_) => format!("--{} argument '{}' too large", option, s),
+        ParseSizeError::ParseFailure(_) => format!("invalid --{} argument {}", option, s.quote()),
+        ParseSizeError::SizeTooBig(_) => format!("--{} argument {} too large", option, s.quote()),
     }
 }
 
@@ -1645,6 +1838,12 @@ fn format_error_message(error: ParseSizeError, s: &str, option: &str) -> String 
 mod tests {
 
     use super::*;
+
+    fn tokenize_helper(line: &str, separator: Option<char>) -> Vec<Field> {
+        let mut buffer = vec![];
+        tokenize(line, separator, &mut buffer);
+        buffer
+    }
 
     #[test]
     fn test_get_hash() {
@@ -1674,7 +1873,7 @@ mod tests {
         let a = "1.2.3-alpha2";
         let b = "1.4.0";
 
-        assert_eq!(Ordering::Less, version_compare(a, b));
+        assert_eq!(Ordering::Less, version_cmp(a, b));
     }
 
     #[test]
@@ -1689,20 +1888,23 @@ mod tests {
     #[test]
     fn test_tokenize_fields() {
         let line = "foo bar b    x";
-        assert_eq!(tokenize(line, None), vec![0..3, 3..7, 7..9, 9..14,],);
+        assert_eq!(tokenize_helper(line, None), vec![0..3, 3..7, 7..9, 9..14,],);
     }
 
     #[test]
     fn test_tokenize_fields_leading_whitespace() {
         let line = "    foo bar b    x";
-        assert_eq!(tokenize(line, None), vec![0..7, 7..11, 11..13, 13..18,]);
+        assert_eq!(
+            tokenize_helper(line, None),
+            vec![0..7, 7..11, 11..13, 13..18,]
+        );
     }
 
     #[test]
     fn test_tokenize_fields_custom_separator() {
         let line = "aaa foo bar b    x";
         assert_eq!(
-            tokenize(line, Some('a')),
+            tokenize_helper(line, Some('a')),
             vec![0..0, 1..1, 2..2, 3..9, 10..18,]
         );
     }
@@ -1710,11 +1912,11 @@ mod tests {
     #[test]
     fn test_tokenize_fields_trailing_custom_separator() {
         let line = "a";
-        assert_eq!(tokenize(line, Some('a')), vec![0..0]);
+        assert_eq!(tokenize_helper(line, Some('a')), vec![0..0]);
         let line = "aa";
-        assert_eq!(tokenize(line, Some('a')), vec![0..0, 1..1]);
+        assert_eq!(tokenize_helper(line, Some('a')), vec![0..0, 1..1]);
         let line = "..a..a";
-        assert_eq!(tokenize(line, Some('a')), vec![0..2, 3..5]);
+        assert_eq!(tokenize_helper(line, Some('a')), vec![0..2, 3..5]);
     }
 
     #[test]
@@ -1722,13 +1924,7 @@ mod tests {
     fn test_line_size() {
         // We should make sure to not regress the size of the Line struct because
         // it is unconditional overhead for every line we sort.
-        assert_eq!(std::mem::size_of::<Line>(), 32);
-        // These are the fields of Line:
-        assert_eq!(std::mem::size_of::<&str>(), 16);
-        assert_eq!(std::mem::size_of::<Box<[Selection]>>(), 16);
-
-        // How big is a selection? Constant cost all lines pay when we need selections.
-        assert_eq!(std::mem::size_of::<Selection>(), 24);
+        assert_eq!(std::mem::size_of::<Line>(), 24);
     }
 
     #[test]

@@ -8,13 +8,11 @@
 //  * that was distributed with this source code.
 
 // spell-checker:ignore (ToDO) lstat
-
-#[macro_use]
-extern crate uucore;
-
 use clap::{crate_version, App, Arg};
 use std::fs;
 use std::io::{ErrorKind, Write};
+use uucore::display::Quotable;
+use uucore::error::{set_exit_code, UResult, UUsageError};
 use uucore::InvalidEncodingHandling;
 
 // operating mode
@@ -25,7 +23,6 @@ enum Mode {
     Both,    // a combination of `Basic` and `Extra`
 }
 
-static NAME: &str = "pathchk";
 static ABOUT: &str = "Check whether file names are valid or portable";
 
 mod options {
@@ -39,37 +36,18 @@ mod options {
 const POSIX_PATH_MAX: usize = 256;
 const POSIX_NAME_MAX: usize = 14;
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... NAME...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... NAME...", uucore::execution_phrase())
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let usage = usage();
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::POSIX)
-                .short("p")
-                .help("check for most POSIX systems"),
-        )
-        .arg(
-            Arg::with_name(options::POSIX_SPECIAL)
-                .short("P")
-                .help(r#"check for empty names and leading "-""#),
-        )
-        .arg(
-            Arg::with_name(options::PORTABILITY)
-                .long(options::PORTABILITY)
-                .help("check for all POSIX systems (equivalent to -p -P)"),
-        )
-        .arg(Arg::with_name(options::PATH).hidden(true).multiple(true))
-        .get_matches_from(args);
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
 
     // set working mode
     let is_posix = matches.values_of(options::POSIX).is_some();
@@ -88,31 +66,48 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
 
     // take necessary actions
     let paths = matches.values_of(options::PATH);
-    let mut res = if paths.is_none() {
-        show_error!("missing operand\nTry {} --help for more information", NAME);
-        false
-    } else {
-        true
-    };
+    if paths.is_none() {
+        return Err(UUsageError::new(1, "missing operand"));
+    }
 
-    if res {
-        // free strings are path operands
-        // FIXME: TCS, seems inefficient and overly verbose (?)
-        for p in paths.unwrap() {
-            let mut path = Vec::new();
-            for path_segment in p.split('/') {
-                path.push(path_segment.to_string());
-            }
-            res &= check_path(&mode, &path);
+    // free strings are path operands
+    // FIXME: TCS, seems inefficient and overly verbose (?)
+    let mut res = true;
+    for p in paths.unwrap() {
+        let mut path = Vec::new();
+        for path_segment in p.split('/') {
+            path.push(path_segment.to_string());
         }
+        res &= check_path(&mode, &path);
     }
 
     // determine error code
-    if res {
-        0
-    } else {
-        1
+    if !res {
+        set_exit_code(1);
     }
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .arg(
+            Arg::with_name(options::POSIX)
+                .short("p")
+                .help("check for most POSIX systems"),
+        )
+        .arg(
+            Arg::with_name(options::POSIX_SPECIAL)
+                .short("P")
+                .help(r#"check for empty names and leading "-""#),
+        )
+        .arg(
+            Arg::with_name(options::PORTABILITY)
+                .long(options::PORTABILITY)
+                .help("check for all POSIX systems (equivalent to -p -P)"),
+        )
+        .arg(Arg::with_name(options::PATH).hidden(true).multiple(true))
 }
 
 // check a path, given as a slice of it's components and an operating mode
@@ -149,10 +144,10 @@ fn check_basic(path: &[String]) -> bool {
         if component_len > POSIX_NAME_MAX {
             writeln!(
                 &mut std::io::stderr(),
-                "limit {} exceeded by length {} of file name component '{}'",
+                "limit {} exceeded by length {} of file name component {}",
                 POSIX_NAME_MAX,
                 component_len,
-                p
+                p.quote()
             );
             return false;
         }
@@ -168,11 +163,11 @@ fn check_basic(path: &[String]) -> bool {
 fn check_extra(path: &[String]) -> bool {
     // components: leading hyphens
     for p in path {
-        if !no_leading_hyphen(p) {
+        if p.starts_with('-') {
             writeln!(
                 &mut std::io::stderr(),
-                "leading hyphen in file name component '{}'",
-                p
+                "leading hyphen in file name component {}",
+                p.quote()
             );
             return false;
         }
@@ -193,10 +188,10 @@ fn check_default(path: &[String]) -> bool {
     if total_len > libc::PATH_MAX as usize {
         writeln!(
             &mut std::io::stderr(),
-            "limit {} exceeded by length {} of file name '{}'",
+            "limit {} exceeded by length {} of file name {}",
             libc::PATH_MAX,
             total_len,
-            joined_path
+            joined_path.quote()
         );
         return false;
     }
@@ -206,10 +201,10 @@ fn check_default(path: &[String]) -> bool {
         if component_len > libc::FILENAME_MAX as usize {
             writeln!(
                 &mut std::io::stderr(),
-                "limit {} exceeded by length {} of file name component '{}'",
+                "limit {} exceeded by length {} of file name component {}",
                 libc::FILENAME_MAX,
                 component_len,
-                p
+                p.quote()
             );
             return false;
         }
@@ -234,11 +229,6 @@ fn check_searchable(path: &str) -> bool {
     }
 }
 
-// check for a hyphen at the beginning of a path segment
-fn no_leading_hyphen(path_segment: &str) -> bool {
-    !path_segment.starts_with('-')
-}
-
 // check whether a path segment contains only valid (read: portable) characters
 fn check_portable_chars(path_segment: &str) -> bool {
     const VALID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
@@ -247,9 +237,9 @@ fn check_portable_chars(path_segment: &str) -> bool {
             let invalid = path_segment[i..].chars().next().unwrap();
             writeln!(
                 &mut std::io::stderr(),
-                "nonportable character '{}' in file name component '{}'",
+                "nonportable character '{}' in file name component {}",
                 invalid,
-                path_segment
+                path_segment.quote()
             );
             return false;
         }

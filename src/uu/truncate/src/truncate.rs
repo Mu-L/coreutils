@@ -15,6 +15,8 @@ use std::convert::TryFrom;
 use std::fs::{metadata, OpenOptions};
 use std::io::ErrorKind;
 use std::path::Path;
+use uucore::display::Quotable;
+use uucore::error::{UIoError, UResult, USimpleError, UUsageError};
 use uucore::parse_size::{parse_size, ParseSizeError};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -63,8 +65,8 @@ pub mod options {
     pub static ARG_FILES: &str = "files";
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... [FILE]...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... [FILE]...", uucore::execution_phrase())
 }
 
 fn get_long_usage() -> String {
@@ -89,15 +91,53 @@ fn get_long_usage() -> String {
     )
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let usage = usage();
     let long_usage = get_long_usage();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
+    let matches = uu_app()
         .usage(&usage[..])
         .after_help(&long_usage[..])
+        .get_matches_from(args);
+
+    let files: Vec<String> = matches
+        .values_of(options::ARG_FILES)
+        .map(|v| v.map(ToString::to_string).collect())
+        .unwrap_or_default();
+
+    if files.is_empty() {
+        return Err(UUsageError::new(1, "missing file operand"));
+    } else {
+        let io_blocks = matches.is_present(options::IO_BLOCKS);
+        let no_create = matches.is_present(options::NO_CREATE);
+        let reference = matches.value_of(options::REFERENCE).map(String::from);
+        let size = matches.value_of(options::SIZE).map(String::from);
+        truncate(no_create, io_blocks, reference, size, files).map_err(|e| {
+            match e.kind() {
+                ErrorKind::NotFound => {
+                    // TODO Improve error-handling so that the error
+                    // returned by `truncate()` provides the necessary
+                    // parameter for formatting the error message.
+                    let reference = matches.value_of(options::REFERENCE).map(String::from);
+                    USimpleError::new(
+                        1,
+                        format!(
+                            "cannot stat {}: No such file or directory",
+                            reference.as_deref().unwrap_or("").quote()
+                        ),
+                    ) // TODO: fix '--no-create' see test_reference and test_truncate_bytes_size
+                }
+                _ => uio_error!(e, ""),
+            }
+        })
+    }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
         .arg(
             Arg::with_name(options::IO_BLOCKS)
             .short("o")
@@ -132,40 +172,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
              .takes_value(true)
              .required(true)
              .min_values(1))
-        .get_matches_from(args);
-
-    let files: Vec<String> = matches
-        .values_of(options::ARG_FILES)
-        .map(|v| v.map(ToString::to_string).collect())
-        .unwrap_or_default();
-
-    if files.is_empty() {
-        show_error!("Missing an argument");
-        return 1;
-    } else {
-        let io_blocks = matches.is_present(options::IO_BLOCKS);
-        let no_create = matches.is_present(options::NO_CREATE);
-        let reference = matches.value_of(options::REFERENCE).map(String::from);
-        let size = matches.value_of(options::SIZE).map(String::from);
-        if let Err(e) = truncate(no_create, io_blocks, reference, size, files) {
-            match e.kind() {
-                ErrorKind::NotFound => {
-                    // TODO Improve error-handling so that the error
-                    // returned by `truncate()` provides the necessary
-                    // parameter for formatting the error message.
-                    let reference = matches.value_of(options::REFERENCE).map(String::from);
-                    crash!(
-                        1,
-                        "cannot stat '{}': No such file or directory",
-                        reference.unwrap_or_else(|| "".to_string())
-                    ); // TODO: fix '--no-create' see test_reference and test_truncate_bytes_size
-                }
-                _ => crash!(1, "{}", e.to_string()),
-            }
-        }
-    }
-
-    0
 }
 
 /// Truncate the named file to the specified size.
@@ -210,7 +216,7 @@ fn truncate_reference_and_size(
     let mode = match parse_mode_and_size(size_string) {
         Ok(m) => match m {
             TruncateMode::Absolute(_) => {
-                crash!(1, "you must specify a relative ‘--size’ with ‘--reference’")
+                crash!(1, "you must specify a relative '--size' with '--reference'")
             }
             _ => m,
         },
@@ -298,7 +304,7 @@ fn truncate(
         }
         (Some(rfilename), None) => truncate_reference_file_only(&rfilename, filenames, create),
         (None, Some(size_string)) => truncate_size_only(&size_string, filenames, create),
-        (None, None) => crash!(1, "you must specify either --reference or --size"), // this case cannot happen anymore because it's handled by clap
+        (None, None) => unreachable!(), // this case cannot happen anymore because it's handled by clap
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "uu_link"
-version = "0.0.6"
+version = "0.0.9"
 authors = ["uutils developers"]
 license = "MIT"
 description = "link ~ (uutils) create a hard (file system) link to FILE"
@@ -16,10 +16,13 @@ path = "src/link.rs"
 
 [dependencies]
 libc = "0.2.42"
-uucore = { version=">=0.0.8", package="uucore", path="../../uucore" }
-uucore_procs = { version=">=0.0.5", package="uucore_procs", path="../../uucore_procs" }
-clap = "2.33"
+uucore = { version=">=0.0.11", package="uucore", path="../../uucore" }
+uucore_procs = { version=">=0.0.8", package="uucore_procs", path="../../uucore_procs" }
+clap = { version = "2.33", features = ["wrap_help"] }
 
 [[bin]]
 name = "link"
 path = "src/main.rs"
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["uucore_procs"]

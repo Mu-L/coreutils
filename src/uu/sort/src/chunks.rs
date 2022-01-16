@@ -14,8 +14,9 @@ use std::{
 
 use memchr::memchr_iter;
 use ouroboros::self_referencing;
+use uucore::error::{UResult, USimpleError};
 
-use crate::{GlobalSettings, Line};
+use crate::{numeric_str_cmp::NumInfo, GeneralF64ParseResult, GlobalSettings, Line, SortError};
 
 /// The chunk that is passed around between threads.
 /// `lines` consist of slices into `buffer`.
@@ -25,28 +26,87 @@ pub struct Chunk {
     pub buffer: Vec<u8>,
     #[borrows(buffer)]
     #[covariant]
-    pub lines: Vec<Line<'this>>,
+    pub contents: ChunkContents<'this>,
+}
+
+#[derive(Debug)]
+pub struct ChunkContents<'a> {
+    pub lines: Vec<Line<'a>>,
+    pub line_data: LineData<'a>,
+}
+
+#[derive(Debug)]
+pub struct LineData<'a> {
+    pub selections: Vec<&'a str>,
+    pub num_infos: Vec<NumInfo>,
+    pub parsed_floats: Vec<GeneralF64ParseResult>,
 }
 
 impl Chunk {
     /// Destroy this chunk and return its components to be reused.
-    ///
-    /// # Returns
-    ///
-    /// * The `lines` vector, emptied
-    /// * The `buffer` vector, **not** emptied
-    pub fn recycle(mut self) -> (Vec<Line<'static>>, Vec<u8>) {
-        let recycled_lines = self.with_lines_mut(|lines| {
-            lines.clear();
-            unsafe {
+    pub fn recycle(mut self) -> RecycledChunk {
+        let recycled_contents = self.with_contents_mut(|contents| {
+            contents.lines.clear();
+            contents.line_data.selections.clear();
+            contents.line_data.num_infos.clear();
+            contents.line_data.parsed_floats.clear();
+            let lines = unsafe {
                 // SAFETY: It is safe to (temporarily) transmute to a vector of lines with a longer lifetime,
                 // because the vector is empty.
                 // Transmuting is necessary to make recycling possible. See https://github.com/rust-lang/rfcs/pull/2802
                 // for a rfc to make this unnecessary. Its example is similar to the code here.
-                std::mem::transmute::<Vec<Line<'_>>, Vec<Line<'static>>>(std::mem::take(lines))
-            }
+                std::mem::transmute::<Vec<Line<'_>>, Vec<Line<'static>>>(std::mem::take(
+                    &mut contents.lines,
+                ))
+            };
+            let selections = unsafe {
+                // SAFETY: (same as above) It is safe to (temporarily) transmute to a vector of &str with a longer lifetime,
+                // because the vector is empty.
+                std::mem::transmute::<Vec<&'_ str>, Vec<&'static str>>(std::mem::take(
+                    &mut contents.line_data.selections,
+                ))
+            };
+            (
+                lines,
+                selections,
+                std::mem::take(&mut contents.line_data.num_infos),
+                std::mem::take(&mut contents.line_data.parsed_floats),
+            )
         });
-        (recycled_lines, self.into_heads().buffer)
+        RecycledChunk {
+            lines: recycled_contents.0,
+            selections: recycled_contents.1,
+            num_infos: recycled_contents.2,
+            parsed_floats: recycled_contents.3,
+            buffer: self.into_heads().buffer,
+        }
+    }
+
+    pub fn lines(&self) -> &Vec<Line> {
+        &self.borrow_contents().lines
+    }
+    pub fn line_data(&self) -> &LineData {
+        &self.borrow_contents().line_data
+    }
+}
+
+pub struct RecycledChunk {
+    lines: Vec<Line<'static>>,
+    selections: Vec<&'static str>,
+    num_infos: Vec<NumInfo>,
+    parsed_floats: Vec<GeneralF64ParseResult>,
+    buffer: Vec<u8>,
+}
+
+impl RecycledChunk {
+    pub fn new(capacity: usize) -> Self {
+        RecycledChunk {
+            lines: Vec::new(),
+            selections: Vec::new(),
+            num_infos: Vec::new(),
+            parsed_floats: Vec::new(),
+            buffer: vec![0; capacity],
+        }
     }
 }
 
@@ -63,28 +123,32 @@ impl Chunk {
 /// (see also `read_to_chunk` for a more detailed documentation)
 ///
 /// * `sender`: The sender to send the lines to the sorter.
-/// * `buffer`: The recycled buffer. All contents will be overwritten, but it must already be filled.
+/// * `recycled_chunk`: The recycled chunk, as returned by `Chunk::recycle`.
 ///   (i.e. `buffer.len()` should be equal to `buffer.capacity()`)
 /// * `max_buffer_size`: How big `buffer` can be.
 /// * `carry_over`: The bytes that must be carried over in between invocations.
 /// * `file`: The current file.
 /// * `next_files`: What `file` should be updated to next.
 /// * `separator`: The line separator.
-/// * `lines`: The recycled vector to fill with lines. Must be empty.
 /// * `settings`: The global settings.
 #[allow(clippy::too_many_arguments)]
 pub fn read<T: Read>(
     sender: &SyncSender<Chunk>,
-    mut buffer: Vec<u8>,
+    recycled_chunk: RecycledChunk,
     max_buffer_size: Option<usize>,
     carry_over: &mut Vec<u8>,
     file: &mut T,
-    next_files: &mut impl Iterator<Item = T>,
+    next_files: &mut impl Iterator<Item = UResult<T>>,
     separator: u8,
-    lines: Vec<Line<'static>>,
     settings: &GlobalSettings,
-) -> bool {
-    assert!(lines.is_empty());
+) -> UResult<bool> {
+    let RecycledChunk {
+        lines,
+        selections,
+        num_infos,
+        parsed_floats,
+        mut buffer,
+    } = recycled_chunk;
     if buffer.len() < carry_over.len() {
         buffer.resize(carry_over.len() + 10 * 1024, 0);
     }
@@ -96,41 +160,56 @@ pub fn read<T: Read>(
         max_buffer_size,
         carry_over.len(),
         separator,
-    );
+    )?;
     carry_over.clear();
     carry_over.extend_from_slice(&buffer[read..]);
 
     if read != 0 {
-        let payload = Chunk::new(buffer, |buf| {
+        let payload: UResult<Chunk> = Chunk::try_new(buffer, |buffer| {
+            let selections = unsafe {
+                // SAFETY: It is safe to transmute to an empty vector of selections with shorter lifetime.
+                // It was only temporarily transmuted to a Vec<Line<'static>> to make recycling possible.
+                std::mem::transmute::<Vec<&'static str>, Vec<&'_ str>>(selections)
+            };
             let mut lines = unsafe {
-                // SAFETY: It is safe to transmute to a vector of lines with shorter lifetime,
+                // SAFETY: (same as above) It is safe to transmute to a vector of lines with shorter lifetime,
                 // because it was only temporarily transmuted to a Vec<Line<'static>> to make recycling possible.
                 std::mem::transmute::<Vec<Line<'static>>, Vec<Line<'_>>>(lines)
             };
-            let read = crash_if_err!(1, std::str::from_utf8(&buf[..read]));
-            parse_lines(read, &mut lines, separator, settings);
-            lines
+            let read = std::str::from_utf8(&buffer[..read])
+                .map_err(|error| SortError::Uft8Error { error })?;
+            let mut line_data = LineData {
+                selections,
+                num_infos,
+                parsed_floats,
+            };
+            parse_lines(read, &mut lines, &mut line_data, separator, settings);
+            Ok(ChunkContents { lines, line_data })
         });
-        sender.send(payload).unwrap();
+        sender.send(payload?).unwrap();
     }
-    should_continue
+    Ok(should_continue)
 }
 
 /// Split `read` into `Line`s, and add them to `lines`.
 fn parse_lines<'a>(
-    mut read: &'a str,
+    read: &'a str,
     lines: &mut Vec<Line<'a>>,
+    line_data: &mut LineData<'a>,
     separator: u8,
     settings: &GlobalSettings,
 ) {
-    // Strip a trailing separator. TODO: Once our MinRustV is 1.45 or above, use strip_suffix() instead.
-    if read.ends_with(separator as char) {
-        read = &read[..read.len() - 1];
-    }
+    let read = read.strip_suffix(separator as char).unwrap_or(read);
 
+    assert!(lines.is_empty());
+    assert!(line_data.selections.is_empty());
+    assert!(line_data.num_infos.is_empty());
+    assert!(line_data.parsed_floats.is_empty());
+    let mut token_buffer = vec![];
     lines.extend(
         read.split(separator as char)
-            .map(|line| Line::create(line, settings)),
+            .enumerate()
+            .map(|(index, line)| Line::create(line, index, line_data, &mut token_buffer, settings)),
     );
 }
 
@@ -162,12 +241,12 @@ fn parse_lines<'a>(
 /// * Whether this function should be called again.
 fn read_to_buffer<T: Read>(
     file: &mut T,
-    next_files: &mut impl Iterator<Item = T>,
+    next_files: &mut impl Iterator<Item = UResult<T>>,
     buffer: &mut Vec<u8>,
     max_buffer_size: Option<usize>,
     start_offset: usize,
     separator: u8,
-) -> (usize, bool) {
+) -> UResult<(usize, bool)> {
     let mut read_target = &mut buffer[start_offset..];
     let mut last_file_target_size = read_target.len();
     loop {
@@ -194,7 +273,7 @@ fn read_to_buffer<T: Read>(
                         // We read enough lines.
                         let end = last_line_end.unwrap();
                         // We want to include the separator here, because it shouldn't be carried over.
-                        return (end + 1, true);
+                        return Ok((end + 1, true));
                     } else {
                         // We need to read more lines
                         let len = buffer.len();
@@ -219,11 +298,11 @@ fn read_to_buffer<T: Read>(
                     if let Some(next_file) = next_files.next() {
                         // There is another file.
                         last_file_target_size = leftover_len;
-                        *file = next_file;
+                        *file = next_file?;
                     } else {
                         // This was the last file.
                         let read_len = buffer.len() - leftover_len;
-                        return (read_len, false);
+                        return Ok((read_len, false));
                     }
                 }
             }
@@ -233,7 +312,7 @@ fn read_to_buffer<T: Read>(
             Err(e) if e.kind() == ErrorKind::Interrupted => {
                 // retry
             }
-            Err(e) => crash!(1, "{}", e),
+            Err(e) => return Err(USimpleError::new(2, e.to_string())),
         }
     }
 }

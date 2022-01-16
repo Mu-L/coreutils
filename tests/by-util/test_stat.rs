@@ -1,3 +1,8 @@
+//  * This file is part of the uutils coreutils package.
+//  *
+//  * For the full copyright and license information, please view the LICENSE
+//  * file that was distributed with this source code.
+
 extern crate regex;
 
 use crate::common::util::*;
@@ -59,7 +64,7 @@ mod test_generate_tokens {
 
     #[test]
     fn printf_format() {
-        let s = "%-# 15a\\r\\\"\\\\\\a\\b\\e\\f\\v%+020.-23w\\x12\\167\\132\\112\\n";
+        let s = "%-# 15a\\t\\r\\\"\\\\\\a\\b\\e\\f\\v%+020.-23w\\x12\\167\\132\\112\\n";
         let expected = vec![
             Token::Directive {
                 flag: F_LEFT | F_ALTER | F_SPACE,
@@ -67,6 +72,7 @@ mod test_generate_tokens {
                 precision: -1,
                 format: 'a',
             },
+            Token::Char('\t'),
             Token::Char('\r'),
             Token::Char('"'),
             Token::Char('\\'),
@@ -96,7 +102,7 @@ fn test_invalid_option() {
     new_ucmd!().arg("-w").arg("-q").arg("/").fails();
 }
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(unix)]
 const NORMAL_FORMAT_STR: &str =
     "%a %A %b %B %d %D %f %F %g %G %h %i %m %n %o %s %u %U %x %X %y %Y %z %Z"; // avoid "%w %W" (birth/creation) due to `stat` limitations and linux kernel & rust version capability variations
 #[cfg(any(target_os = "linux"))]
@@ -109,30 +115,29 @@ const FS_FORMAT_STR: &str = "%b %c %i %l %n %s %S %t %T"; // avoid "%a %d %f" wh
 #[cfg(target_os = "linux")]
 fn test_terse_fs_format() {
     let args = ["-f", "-t", "/proc"];
-    new_ucmd!()
-        .args(&args)
-        .run()
-        .stdout_is(expected_result(&args));
+    let ts = TestScenario::new(util_name!());
+    let expected_stdout = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
+    ts.ucmd().args(&args).run().stdout_is(expected_stdout);
 }
 
 #[test]
 #[cfg(target_os = "linux")]
 fn test_fs_format() {
     let args = ["-f", "-c", FS_FORMAT_STR, "/dev/shm"];
-    new_ucmd!()
-        .args(&args)
-        .run()
-        .stdout_is(expected_result(&args));
+    let ts = TestScenario::new(util_name!());
+    let expected_stdout = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
+    ts.ucmd().args(&args).run().stdout_is(expected_stdout);
 }
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(unix)]
 #[test]
 fn test_terse_normal_format() {
     // note: contains birth/creation date which increases test fragility
     // * results may vary due to built-in `stat` limitations as well as linux kernel and rust version capability variations
     let args = ["-t", "/"];
-    let actual = new_ucmd!().args(&args).succeeds().stdout_move_str();
-    let expect = expected_result(&args);
+    let ts = TestScenario::new(util_name!());
+    let actual = ts.ucmd().args(&args).succeeds().stdout_move_str();
+    let expect = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
     println!("actual: {:?}", actual);
     println!("expect: {:?}", expect);
     let v_actual: Vec<&str> = actual.trim().split(' ').collect();
@@ -156,12 +161,13 @@ fn test_terse_normal_format() {
     );
 }
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(unix)]
 #[test]
 fn test_format_created_time() {
     let args = ["-c", "%w", "/bin"];
-    let actual = new_ucmd!().args(&args).succeeds().stdout_move_str();
-    let expect = expected_result(&args);
+    let ts = TestScenario::new(util_name!());
+    let actual = ts.ucmd().args(&args).succeeds().stdout_move_str();
+    let expect = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
     println!("actual: {:?}", actual);
     println!("expect: {:?}", expect);
     // note: using a regex instead of `split_whitespace()` in order to detect whitespace differences
@@ -180,12 +186,13 @@ fn test_format_created_time() {
     );
 }
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(unix)]
 #[test]
 fn test_format_created_seconds() {
     let args = ["-c", "%W", "/bin"];
-    let actual = new_ucmd!().args(&args).succeeds().stdout_move_str();
-    let expect = expected_result(&args);
+    let ts = TestScenario::new(util_name!());
+    let actual = ts.ucmd().args(&args).succeeds().stdout_move_str();
+    let expect = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
     println!("actual: {:?}", actual);
     println!("expect: {:?}", expect);
     // note: using a regex instead of `split_whitespace()` in order to detect whitespace differences
@@ -204,21 +211,20 @@ fn test_format_created_seconds() {
     );
 }
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(unix)]
 #[test]
 fn test_normal_format() {
     let args = ["-c", NORMAL_FORMAT_STR, "/bin"];
-    new_ucmd!()
-        .args(&args)
-        .succeeds()
-        .stdout_is(expected_result(&args));
+    let ts = TestScenario::new(util_name!());
+    let expected_stdout = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
+    ts.ucmd().args(&args).succeeds().stdout_is(expected_stdout);
 }
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(unix)]
 #[test]
 fn test_symlinks() {
-    let scene = TestScenario::new(util_name!());
-    let at = &scene.fixtures;
+    let ts = TestScenario::new(util_name!());
+    let at = &ts.fixtures;
 
     let mut tested: bool = false;
     // arbitrarily chosen symlinks with hope that the CI environment provides at least one of them
@@ -232,18 +238,12 @@ fn test_symlinks() {
         if at.file_exists(file) && at.is_symlink(file) {
             tested = true;
             let args = ["-c", NORMAL_FORMAT_STR, file];
-            scene
-                .ucmd()
-                .args(&args)
-                .succeeds()
-                .stdout_is(expected_result(&args));
+            let expected_stdout = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
+            ts.ucmd().args(&args).succeeds().stdout_is(expected_stdout);
             // -L, --dereference    follow links
             let args = ["-L", "-c", NORMAL_FORMAT_STR, file];
-            scene
-                .ucmd()
-                .args(&args)
-                .succeeds()
-                .stdout_is(expected_result(&args));
+            let expected_stdout = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
+            ts.ucmd().args(&args).succeeds().stdout_is(expected_stdout);
         }
     }
     if !tested {
@@ -269,13 +269,12 @@ fn test_char() {
         #[cfg(any(target_vendor = "apple"))]
         "/dev/ptmx",
     ];
-    new_ucmd!()
-        .args(&args)
-        .succeeds()
-        .stdout_is(expected_result(&args));
+    let ts = TestScenario::new(util_name!());
+    let expected_stdout = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
+    ts.ucmd().args(&args).succeeds().stdout_is(expected_stdout);
 }
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(unix)]
 #[test]
 fn test_multi_files() {
     let args = [
@@ -287,38 +286,19 @@ fn test_multi_files() {
         "/etc/fstab",
         "/var",
     ];
-    new_ucmd!()
-        .args(&args)
-        .succeeds()
-        .stdout_is(expected_result(&args));
+    let ts = TestScenario::new(util_name!());
+    let expected_stdout = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
+    ts.ucmd().args(&args).succeeds().stdout_is(expected_stdout);
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_printf() {
     let args = [
         "--printf=123%-# 15q\\r\\\"\\\\\\a\\b\\e\\f\\v%+020.23m\\x12\\167\\132\\112\\n",
         "/",
     ];
-    new_ucmd!()
-        .args(&args)
-        .succeeds()
-        .stdout_is(expected_result(&args));
-}
-
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
-fn expected_result(args: &[&str]) -> String {
-    #[cfg(target_os = "linux")]
-    let util_name = util_name!();
-    #[cfg(target_vendor = "apple")]
-    let util_name = format!("g{}", util_name!());
-
-    // note: clippy::needless_borrow *false positive*
-    #[allow(clippy::needless_borrow)]
-    TestScenario::new(&util_name)
-        .cmd_keepenv(util_name)
-        .env("LANGUAGE", "C")
-        .args(args)
-        .succeeds()
-        .stdout_move_str()
+    let ts = TestScenario::new(util_name!());
+    let expected_stdout = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
+    ts.ucmd().args(&args).succeeds().stdout_is(expected_stdout);
 }

@@ -4,14 +4,11 @@
 //  *
 //  * For the full copyright and license information, please view the LICENSE
 //  * file that was distributed with this source code.
-
-#[macro_use]
-extern crate uucore;
-
 use clap::{crate_version, App, Arg};
 use std::fs::hard_link;
-use std::io::Error;
 use std::path::Path;
+use uucore::display::Quotable;
+use uucore::error::{FromIo, UResult};
 
 static ABOUT: &str = "Call the link function to create a link named FILE2 to an existing FILE1.";
 
@@ -19,32 +16,14 @@ pub mod options {
     pub static FILES: &str = "FILES";
 }
 
-fn get_usage() -> String {
-    format!("{0} FILE1 FILE2", executable!())
+fn usage() -> String {
+    format!("{0} FILE1 FILE2", uucore::execution_phrase())
 }
 
-pub fn normalize_error_message(e: Error) -> String {
-    match e.raw_os_error() {
-        Some(2) => String::from("No such file or directory (os error 2)"),
-        _ => format!("{}", e),
-    }
-}
-
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::FILES)
-                .hidden(true)
-                .required(true)
-                .min_values(2)
-                .max_values(2)
-                .takes_value(true),
-        )
-        .get_matches_from(args);
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let usage = usage();
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
 
     let files: Vec<_> = matches
         .values_of_os(options::FILES)
@@ -53,11 +32,20 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     let old = Path::new(files[0]);
     let new = Path::new(files[1]);
 
-    match hard_link(old, new) {
-        Ok(_) => 0,
-        Err(err) => {
-            show_error!("{}", normalize_error_message(err));
-            1
-        }
-    }
+    hard_link(old, new)
+        .map_err_context(|| format!("cannot create link {} to {}", new.quote(), old.quote()))
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .arg(
+            Arg::with_name(options::FILES)
+                .hidden(true)
+                .required(true)
+                .min_values(2)
+                .max_values(2)
+                .takes_value(true),
+        )
 }

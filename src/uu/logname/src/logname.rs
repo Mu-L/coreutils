@@ -12,10 +12,10 @@
 #[macro_use]
 extern crate uucore;
 
-use std::ffi::CStr;
-use uucore::InvalidEncodingHandling;
-
 use clap::{crate_version, App};
+use std::ffi::CStr;
+use uucore::error::UResult;
+use uucore::InvalidEncodingHandling;
 
 extern "C" {
     // POSIX requires using getlogin (or equivalent code)
@@ -35,26 +35,28 @@ fn get_userlogin() -> Option<String> {
 
 static SUMMARY: &str = "Print user's login name";
 
-fn get_usage() -> String {
-    String::from(executable!())
+fn usage() -> &'static str {
+    uucore::execution_phrase()
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let usage = get_usage();
-    let _ = App::new(executable!())
-        .version(crate_version!())
-        .about(SUMMARY)
-        .usage(&usage[..])
-        .get_matches_from(args);
+    let _ = uu_app().usage(usage()).get_matches_from(args);
 
     match get_userlogin() {
         Some(userlogin) => println!("{}", userlogin),
         None => show_error!("no login name"),
     }
 
-    0
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(SUMMARY)
 }

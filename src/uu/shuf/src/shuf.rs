@@ -7,13 +7,12 @@
 
 // spell-checker:ignore (ToDO) cmdline evec seps rvec fdata
 
-#[macro_use]
-extern crate uucore;
-
 use clap::{crate_version, App, Arg};
 use rand::Rng;
 use std::fs::File;
 use std::io::{stdin, stdout, BufReader, BufWriter, Read, Write};
+use uucore::display::Quotable;
+use uucore::error::{FromIo, UResult, USimpleError};
 use uucore::InvalidEncodingHandling;
 
 enum Mode {
@@ -51,12 +50,74 @@ mod options {
     pub static FILE: &str = "file";
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().get_matches_from(args);
+
+    let mode = if let Some(args) = matches.values_of(options::ECHO) {
+        Mode::Echo(args.map(String::from).collect())
+    } else if let Some(range) = matches.value_of(options::INPUT_RANGE) {
+        match parse_range(range) {
+            Ok(m) => Mode::InputRange(m),
+            Err(msg) => {
+                return Err(USimpleError::new(1, msg));
+            }
+        }
+    } else {
+        Mode::Default(matches.value_of(options::FILE).unwrap_or("-").to_string())
+    };
+
+    let options = Options {
+        head_count: match matches.value_of(options::HEAD_COUNT) {
+            Some(count) => match count.parse::<usize>() {
+                Ok(val) => val,
+                Err(_) => {
+                    return Err(USimpleError::new(
+                        1,
+                        format!("invalid line count: {}", count.quote()),
+                    ));
+                }
+            },
+            None => std::usize::MAX,
+        },
+        output: matches.value_of(options::OUTPUT).map(String::from),
+        random_source: matches.value_of(options::RANDOM_SOURCE).map(String::from),
+        repeat: matches.is_present(options::REPEAT),
+        sep: if matches.is_present(options::ZERO_TERMINATED) {
+            0x00_u8
+        } else {
+            0x0a_u8
+        },
+    };
+
+    match mode {
+        Mode::Echo(args) => {
+            let mut evec = args.iter().map(String::as_bytes).collect::<Vec<_>>();
+            find_seps(&mut evec, options.sep);
+            shuf_bytes(&mut evec, options)?;
+        }
+        Mode::InputRange((b, e)) => {
+            let rvec = (b..e).map(|x| format!("{}", x)).collect::<Vec<String>>();
+            let mut rvec = rvec.iter().map(String::as_bytes).collect::<Vec<&[u8]>>();
+            shuf_bytes(&mut rvec, options)?;
+        }
+        Mode::Default(filename) => {
+            let fdata = read_input_file(&filename)?;
+            let mut fdata = vec![&fdata[..]];
+            find_seps(&mut fdata, options.sep);
+            shuf_bytes(&mut fdata, options)?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .name(NAME)
         .version(crate_version!())
         .template(TEMPLATE)
@@ -118,80 +179,22 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .help("line delimiter is NUL, not newline"),
         )
         .arg(Arg::with_name(options::FILE).takes_value(true))
-        .get_matches_from(args);
-
-    let mode = if let Some(args) = matches.values_of(options::ECHO) {
-        Mode::Echo(args.map(String::from).collect())
-    } else if let Some(range) = matches.value_of(options::INPUT_RANGE) {
-        match parse_range(range) {
-            Ok(m) => Mode::InputRange(m),
-            Err(msg) => {
-                crash!(1, "{}", msg);
-            }
-        }
-    } else {
-        Mode::Default(matches.value_of(options::FILE).unwrap_or("-").to_string())
-    };
-
-    let options = Options {
-        head_count: match matches.value_of(options::HEAD_COUNT) {
-            Some(count) => match count.parse::<usize>() {
-                Ok(val) => val,
-                Err(_) => {
-                    show_error!("invalid line count: '{}'", count);
-                    return 1;
-                }
-            },
-            None => std::usize::MAX,
-        },
-        output: matches.value_of(options::OUTPUT).map(String::from),
-        random_source: matches.value_of(options::RANDOM_SOURCE).map(String::from),
-        repeat: matches.is_present(options::REPEAT),
-        sep: if matches.is_present(options::ZERO_TERMINATED) {
-            0x00_u8
-        } else {
-            0x0a_u8
-        },
-    };
-
-    match mode {
-        Mode::Echo(args) => {
-            let mut evec = args.iter().map(String::as_bytes).collect::<Vec<_>>();
-            find_seps(&mut evec, options.sep);
-            shuf_bytes(&mut evec, options);
-        }
-        Mode::InputRange((b, e)) => {
-            let rvec = (b..e).map(|x| format!("{}", x)).collect::<Vec<String>>();
-            let mut rvec = rvec.iter().map(String::as_bytes).collect::<Vec<&[u8]>>();
-            shuf_bytes(&mut rvec, options);
-        }
-        Mode::Default(filename) => {
-            let fdata = read_input_file(&filename);
-            let mut fdata = vec![&fdata[..]];
-            find_seps(&mut fdata, options.sep);
-            shuf_bytes(&mut fdata, options);
-        }
-    }
-
-    0
 }
 
-fn read_input_file(filename: &str) -> Vec<u8> {
+fn read_input_file(filename: &str) -> UResult<Vec<u8>> {
     let mut file = BufReader::new(if filename == "-" {
         Box::new(stdin()) as Box<dyn Read>
     } else {
-        match File::open(filename) {
-            Ok(f) => Box::new(f) as Box<dyn Read>,
-            Err(e) => crash!(1, "failed to open '{}': {}", filename, e),
-        }
+        let file = File::open(filename)
+            .map_err_context(|| format!("failed to open {}", filename.quote()))?;
+        Box::new(file) as Box<dyn Read>
     });
 
     let mut data = Vec::new();
-    if let Err(e) = file.read_to_end(&mut data) {
-        crash!(1, "failed reading '{}': {}", filename, e)
-    };
+    file.read_to_end(&mut data)
+        .map_err_context(|| format!("failed reading {}", filename.quote()))?;
 
-    data
+    Ok(data)
 }
 
 fn find_seps(data: &mut Vec<&[u8]>, sep: u8) {
@@ -227,20 +230,22 @@ fn find_seps(data: &mut Vec<&[u8]>, sep: u8) {
     }
 }
 
-fn shuf_bytes(input: &mut Vec<&[u8]>, opts: Options) {
+fn shuf_bytes(input: &mut Vec<&[u8]>, opts: Options) -> UResult<()> {
     let mut output = BufWriter::new(match opts.output {
         None => Box::new(stdout()) as Box<dyn Write>,
-        Some(s) => match File::create(&s[..]) {
-            Ok(f) => Box::new(f) as Box<dyn Write>,
-            Err(e) => crash!(1, "failed to open '{}' for writing: {}", &s[..], e),
-        },
+        Some(s) => {
+            let file = File::create(&s[..])
+                .map_err_context(|| format!("failed to open {} for writing", s.quote()))?;
+            Box::new(file) as Box<dyn Write>
+        }
     });
 
     let mut rng = match opts.random_source {
-        Some(r) => WrappedRng::RngFile(rand::read::ReadRng::new(match File::open(&r[..]) {
-            Ok(f) => f,
-            Err(e) => crash!(1, "failed to open random source '{}': {}", &r[..], e),
-        })),
+        Some(r) => {
+            let file = File::open(&r[..])
+                .map_err_context(|| format!("failed to open random source {}", r.quote()))?;
+            WrappedRng::RngFile(rand::rngs::adapter::ReadRng::new(file))
+        }
         None => WrappedRng::RngDefault(rand::thread_rng()),
     };
 
@@ -262,10 +267,10 @@ fn shuf_bytes(input: &mut Vec<&[u8]>, opts: Options) {
         // write the randomly chosen value and the separator
         output
             .write_all(input[r])
-            .unwrap_or_else(|e| crash!(1, "write failed: {}", e));
+            .map_err_context(|| "write failed".to_string())?;
         output
             .write_all(&[opts.sep])
-            .unwrap_or_else(|e| crash!(1, "write failed: {}", e));
+            .map_err_context(|| "write failed".to_string())?;
 
         // if we do not allow repeats, remove the chosen value from the input vector
         if !opts.repeat {
@@ -278,26 +283,27 @@ fn shuf_bytes(input: &mut Vec<&[u8]>, opts: Options) {
 
         count -= 1;
     }
+    Ok(())
 }
 
 fn parse_range(input_range: &str) -> Result<(usize, usize), String> {
     let split: Vec<&str> = input_range.split('-').collect();
     if split.len() != 2 {
-        Err(format!("invalid input range: '{}'", input_range))
+        Err(format!("invalid input range: {}", input_range.quote()))
     } else {
         let begin = split[0]
             .parse::<usize>()
-            .map_err(|_| format!("invalid input range: '{}'", split[0]))?;
+            .map_err(|_| format!("invalid input range: {}", split[0].quote()))?;
         let end = split[1]
             .parse::<usize>()
-            .map_err(|_| format!("invalid input range: '{}'", split[1]))?;
+            .map_err(|_| format!("invalid input range: {}", split[1].quote()))?;
         Ok((begin, end + 1))
     }
 }
 
 enum WrappedRng {
-    RngFile(rand::read::ReadRng<File>),
-    RngDefault(rand::ThreadRng),
+    RngFile(rand::rngs::adapter::ReadRng<File>),
+    RngDefault(rand::rngs::ThreadRng),
 }
 
 impl WrappedRng {

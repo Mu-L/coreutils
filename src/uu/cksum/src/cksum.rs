@@ -6,14 +6,13 @@
 // file that was distributed with this source code.
 
 // spell-checker:ignore (ToDO) fname
-
-#[macro_use]
-extern crate uucore;
-
 use clap::{crate_version, App, Arg};
 use std::fs::File;
 use std::io::{self, stdin, BufReader, Read};
 use std::path::Path;
+use uucore::display::Quotable;
+use uucore::error::{FromIo, UResult};
+use uucore::show;
 use uucore::InvalidEncodingHandling;
 
 // NOTE: CRC_TABLE_LEN *must* be <= 256 as we cast 0..CRC_TABLE_LEN to u8
@@ -24,60 +23,15 @@ const NAME: &str = "cksum";
 const SYNTAX: &str = "[OPTIONS] [FILE]...";
 const SUMMARY: &str = "Print CRC and size for each file";
 
-// this is basically a hack to get "loops" to work on Rust 1.33.  Once we update to Rust 1.46 or
-// greater, we can just use while loops
-macro_rules! unroll {
-    (256, |$i:ident| $s:expr) => {{
-        unroll!(@ 32, 0 * 32, $i, $s);
-        unroll!(@ 32, 1 * 32, $i, $s);
-        unroll!(@ 32, 2 * 32, $i, $s);
-        unroll!(@ 32, 3 * 32, $i, $s);
-        unroll!(@ 32, 4 * 32, $i, $s);
-        unroll!(@ 32, 5 * 32, $i, $s);
-        unroll!(@ 32, 6 * 32, $i, $s);
-        unroll!(@ 32, 7 * 32, $i, $s);
-    }};
-    (8, |$i:ident| $s:expr) => {{
-        unroll!(@ 8, 0, $i, $s);
-    }};
-
-    (@ 32, $start:expr, $i:ident, $s:expr) => {{
-        unroll!(@ 8, $start + 0 * 8, $i, $s);
-        unroll!(@ 8, $start + 1 * 8, $i, $s);
-        unroll!(@ 8, $start + 2 * 8, $i, $s);
-        unroll!(@ 8, $start + 3 * 8, $i, $s);
-    }};
-    (@ 8, $start:expr, $i:ident, $s:expr) => {{
-        unroll!(@ 4, $start, $i, $s);
-        unroll!(@ 4, $start + 4, $i, $s);
-    }};
-    (@ 4, $start:expr, $i:ident, $s:expr) => {{
-        unroll!(@ 2, $start, $i, $s);
-        unroll!(@ 2, $start + 2, $i, $s);
-    }};
-    (@ 2, $start:expr, $i:ident, $s:expr) => {{
-        unroll!(@ 1, $start, $i, $s);
-        unroll!(@ 1, $start + 1, $i, $s);
-    }};
-    (@ 1, $start:expr, $i:ident, $s:expr) => {{
-        let $i = $start;
-        let _ = $s;
-    }};
-}
-
 const fn generate_crc_table() -> [u32; CRC_TABLE_LEN] {
     let mut table = [0; CRC_TABLE_LEN];
 
-    // NOTE: works on Rust 1.46
-    //let mut i = 0;
-    //while i < CRC_TABLE_LEN {
-    //    table[i] = crc_entry(i as u8) as u32;
-    //
-    //    i += 1;
-    //}
-    unroll!(256, |i| {
+    let mut i = 0;
+    while i < CRC_TABLE_LEN {
         table[i] = crc_entry(i as u8) as u32;
-    });
+
+        i += 1;
+    }
 
     table
 }
@@ -85,19 +39,8 @@ const fn generate_crc_table() -> [u32; CRC_TABLE_LEN] {
 const fn crc_entry(input: u8) -> u32 {
     let mut crc = (input as u32) << 24;
 
-    // NOTE: this does not work on Rust 1.33, but *does* on 1.46
-    //let mut i = 0;
-    //while i < 8 {
-    //    if crc & 0x8000_0000 != 0 {
-    //        crc <<= 1;
-    //        crc ^= 0x04c1_1db7;
-    //    } else {
-    //        crc <<= 1;
-    //    }
-    //
-    //    i += 1;
-    //}
-    unroll!(8, |_i| {
+    let mut i = 0;
+    while i < 8 {
         let if_condition = crc & 0x8000_0000;
         let if_body = (crc << 1) ^ 0x04c1_1db7;
         let else_body = crc << 1;
@@ -107,7 +50,8 @@ const fn crc_entry(input: u8) -> u32 {
         let condition_table = [else_body, if_body];
 
         crc = condition_table[(if_condition != 0) as usize];
-    });
+        i += 1;
+    }
 
     crc
 }
@@ -136,25 +80,18 @@ fn cksum(fname: &str) -> io::Result<(u32, usize)> {
     let mut crc = 0u32;
     let mut size = 0usize;
 
-    let file;
     let mut rd: Box<dyn Read> = match fname {
         "-" => Box::new(stdin()),
         _ => {
-            let path = &Path::new(fname);
-            if path.is_dir() {
-                return Err(std::io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Is a directory",
-                ));
-            };
-            if path.metadata().is_err() {
-                return Err(std::io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "No such file or directory",
-                ));
-            };
-            file = File::open(&path)?;
-            Box::new(BufReader::new(file))
+            let p = Path::new(fname);
+
+            // Directories should not give an error, but should be interpreted
+            // as empty files to match GNU semantics.
+            if p.is_dir() {
+                Box::new(BufReader::new(io::empty())) as Box<dyn Read>
+            } else {
+                Box::new(BufReader::new(File::open(p)?)) as Box<dyn Read>
+            }
         }
     };
 
@@ -175,18 +112,13 @@ mod options {
     pub static FILE: &str = "file";
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let matches = App::new(executable!())
-        .name(NAME)
-        .version(crate_version!())
-        .about(SUMMARY)
-        .usage(SYNTAX)
-        .arg(Arg::with_name(options::FILE).hidden(true).multiple(true))
-        .get_matches_from(args);
+    let matches = uu_app().get_matches_from(args);
 
     let files: Vec<String> = match matches.values_of(options::FILE) {
         Some(v) => v.clone().map(|v| v.to_owned()).collect(),
@@ -194,26 +126,25 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     };
 
     if files.is_empty() {
-        match cksum("-") {
-            Ok((crc, size)) => println!("{} {}", crc, size),
-            Err(err) => {
-                show_error!("{}", err);
-                return 2;
-            }
-        }
-        return 0;
+        let (crc, size) = cksum("-")?;
+        println!("{} {}", crc, size);
+        return Ok(());
     }
 
-    let mut exit_code = 0;
     for fname in &files {
-        match cksum(fname.as_ref()) {
+        match cksum(fname.as_ref()).map_err_context(|| format!("{}", fname.maybe_quote())) {
             Ok((crc, size)) => println!("{} {} {}", crc, size, fname),
-            Err(err) => {
-                show_error!("'{}' {}", fname, err);
-                exit_code = 2;
-            }
-        }
+            Err(err) => show!(err),
+        };
     }
+    Ok(())
+}
 
-    exit_code
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .name(NAME)
+        .version(crate_version!())
+        .about(SUMMARY)
+        .usage(SYNTAX)
+        .arg(Arg::with_name(options::FILE).hidden(true).multiple(true))
 }

@@ -1,38 +1,42 @@
-use crate::common::util::*;
+//  * This file is part of the uutils coreutils package.
+//  *
+//  * For the full copyright and license information, please view the LICENSE
+//  * file that was distributed with this source code.
 
 // spell-checker:ignore (flags) runlevel mesg
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+use crate::common::util::*;
+
+#[cfg(unix)]
 #[test]
 fn test_count() {
+    let ts = TestScenario::new(util_name!());
     for opt in &["-q", "--count"] {
-        new_ucmd!()
-            .arg(opt)
-            .succeeds()
-            .stdout_is(expected_result(&[opt]));
+        let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+        ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_boot() {
+    let ts = TestScenario::new(util_name!());
     for opt in &["-b", "--boot"] {
-        new_ucmd!()
-            .arg(opt)
-            .succeeds()
-            .stdout_is(expected_result(&[opt]));
+        let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+        ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_heading() {
+    let ts = TestScenario::new(util_name!());
     for opt in &["-H", "--heading"] {
         // allow whitespace variation
         // * minor whitespace differences occur between platform built-in outputs;
         //   specifically number of TABs between "TIME" and "COMMENT" may be variant
-        let actual = new_ucmd!().arg(opt).succeeds().stdout_move_str();
-        let expect = expected_result(&[opt]);
+        let actual = ts.ucmd().arg(opt).succeeds().stdout_move_str();
+        let expect = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
         println!("actual: {:?}", actual);
         println!("expect: {:?}", expect);
         let v_actual: Vec<&str> = actual.split_whitespace().collect();
@@ -41,76 +45,70 @@ fn test_heading() {
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_short() {
+    let ts = TestScenario::new(util_name!());
     for opt in &["-s", "--short"] {
-        new_ucmd!()
-            .arg(opt)
-            .succeeds()
-            .stdout_is(expected_result(&[opt]));
+        let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+        ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_login() {
+    let ts = TestScenario::new(util_name!());
     for opt in &["-l", "--login"] {
-        new_ucmd!()
-            .arg(opt)
-            .succeeds()
-            .stdout_is(expected_result(&[opt]));
+        let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+        ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_m() {
+    let ts = TestScenario::new(util_name!());
     for opt in &["-m"] {
-        new_ucmd!()
-            .arg(opt)
-            .succeeds()
-            .stdout_is(expected_result(&[opt]));
+        let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+        ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_process() {
+    let ts = TestScenario::new(util_name!());
     for opt in &["-p", "--process"] {
-        new_ucmd!()
-            .arg(opt)
-            .succeeds()
-            .stdout_is(expected_result(&[opt]));
+        let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+        ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn test_runlevel() {
+    let ts = TestScenario::new(util_name!());
     for opt in &["-r", "--runlevel"] {
-        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-        new_ucmd!()
-            .arg(opt)
-            .succeeds()
-            .stdout_is(expected_result(&[opt]));
+        let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+        ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
 
         #[cfg(not(target_os = "linux"))]
-        new_ucmd!().arg(opt).succeeds().stdout_is("");
+        ts.ucmd().arg(opt).succeeds().stdout_is("");
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_time() {
+    let ts = TestScenario::new(util_name!());
     for opt in &["-t", "--time"] {
-        new_ucmd!()
-            .arg(opt)
-            .succeeds()
-            .stdout_is(expected_result(&[opt]));
+        let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+        ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_mesg() {
     // -T, -w, --mesg
@@ -119,22 +117,20 @@ fn test_mesg() {
     //     same as -T
     // --writable
     //     same as -T
+    let ts = TestScenario::new(util_name!());
     for opt in &["-T", "-w", "--mesg", "--message", "--writable"] {
-        new_ucmd!()
-            .arg(opt)
-            .succeeds()
-            .stdout_is(expected_result(&[opt]));
+        let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+        ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn test_arg1_arg2() {
     let args = ["am", "i"];
-
-    new_ucmd!()
-        .args(&args)
-        .succeeds()
-        .stdout_is(expected_result(&args));
+    let ts = TestScenario::new(util_name!());
+    let expected_stdout = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
+    ts.ucmd().args(&args).succeeds().stdout_is(expected_stdout);
 }
 
 #[test]
@@ -146,53 +142,51 @@ fn test_too_many_args() {
     new_ucmd!().args(&args).fails().stderr_contains(EXPECTED);
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_users() {
+    let ts = TestScenario::new(util_name!());
     for opt in &["-u", "--users"] {
-        let actual = new_ucmd!().arg(opt).succeeds().stdout_move_str();
-        let expect = expected_result(&[opt]);
+        let actual = ts.ucmd().arg(opt).succeeds().stdout_move_str();
+        let expect = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
         println!("actual: {:?}", actual);
         println!("expect: {:?}", expect);
 
         let mut v_actual: Vec<&str> = actual.split_whitespace().collect();
         let mut v_expect: Vec<&str> = expect.split_whitespace().collect();
 
-        // TODO: `--users` differs from GNU's output on macOS
-        // Diff < left / right > :
-        // <"runner   console      2021-05-20 22:03 00:08         196\n"
-        // >"runner   console      2021-05-20 22:03  old          196\n"
+        // TODO: `--users` sometimes differs from GNU's output on macOS (race condition?)
+        // actual: "runner   console      Jun 23 06:37 00:34         196\n"
+        // expect: "runner   console      Jun 23 06:37  old          196\n"
         if cfg!(target_os = "macos") {
-            v_actual.remove(4);
-            v_expect.remove(4);
+            v_actual.remove(5);
+            v_expect.remove(5);
         }
 
         assert_eq!(v_actual, v_expect);
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_lookup() {
     let opt = "--lookup";
-    new_ucmd!()
-        .arg(opt)
-        .succeeds()
-        .stdout_is(expected_result(&[opt]));
+    let ts = TestScenario::new(util_name!());
+    let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+    ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_dead() {
+    let ts = TestScenario::new(util_name!());
     for opt in &["-d", "--dead"] {
-        new_ucmd!()
-            .arg(opt)
-            .succeeds()
-            .stdout_is(expected_result(&[opt]));
+        let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+        ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_all_separately() {
     if cfg!(target_os = "macos") {
@@ -202,20 +196,14 @@ fn test_all_separately() {
 
     // -a, --all         same as -b -d --login -p -r -t -T -u
     let args = ["-b", "-d", "--login", "-p", "-r", "-t", "-T", "-u"];
-    let scene = TestScenario::new(util_name!());
-    scene
-        .ucmd()
-        .args(&args)
-        .succeeds()
-        .stdout_is(expected_result(&args));
-    scene
-        .ucmd()
-        .arg("--all")
-        .succeeds()
-        .stdout_is(expected_result(&args));
+    let ts = TestScenario::new(util_name!());
+    let expected_stdout = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
+    ts.ucmd().args(&args).succeeds().stdout_is(expected_stdout);
+    let expected_stdout = unwrap_or_return!(expected_result(&ts, &["--all"])).stdout_move_str();
+    ts.ucmd().arg("--all").succeeds().stdout_is(expected_stdout);
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[test]
 fn test_all() {
     if cfg!(target_os = "macos") {
@@ -223,27 +211,9 @@ fn test_all() {
         return;
     }
 
+    let ts = TestScenario::new(util_name!());
     for opt in &["-a", "--all"] {
-        new_ucmd!()
-            .arg(opt)
-            .succeeds()
-            .stdout_is(expected_result(&[opt]));
+        let expected_stdout = unwrap_or_return!(expected_result(&ts, &[opt])).stdout_move_str();
+        ts.ucmd().arg(opt).succeeds().stdout_is(expected_stdout);
     }
-}
-
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
-fn expected_result(args: &[&str]) -> String {
-    #[cfg(target_os = "linux")]
-    let util_name = util_name!();
-    #[cfg(target_vendor = "apple")]
-    let util_name = format!("g{}", util_name!());
-
-    // note: clippy::needless_borrow *false positive*
-    #[allow(clippy::needless_borrow)]
-    TestScenario::new(&util_name)
-        .cmd_keepenv(util_name)
-        .env("LANGUAGE", "C")
-        .args(args)
-        .succeeds()
-        .stdout_move_str()
 }

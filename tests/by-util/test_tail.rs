@@ -24,6 +24,15 @@ fn test_stdin_default() {
 }
 
 #[test]
+fn test_stdin_explicit() {
+    new_ucmd!()
+        .pipe_in_fixture(FOOBAR_TXT)
+        .arg("-")
+        .run()
+        .stdout_is_fixture("foobar_stdin_default.expected");
+}
+
+#[test]
 fn test_single_default() {
     new_ucmd!()
         .arg(FOOBAR_TXT)
@@ -349,6 +358,36 @@ fn test_positive_lines() {
         .stdout_is("c\nd\ne\n");
 }
 
+/// Test for reading all but the first NUM lines: `tail -3`.
+#[test]
+fn test_obsolete_syntax_positive_lines() {
+    new_ucmd!()
+        .args(&["-3"])
+        .pipe_in("a\nb\nc\nd\ne\n")
+        .succeeds()
+        .stdout_is("c\nd\ne\n");
+}
+
+/// Test for reading all but the first NUM lines: `tail -n -10`.
+#[test]
+fn test_small_file() {
+    new_ucmd!()
+        .args(&["-n -10"])
+        .pipe_in("a\nb\nc\nd\ne\n")
+        .succeeds()
+        .stdout_is("a\nb\nc\nd\ne\n");
+}
+
+/// Test for reading all but the first NUM lines: `tail -10`.
+#[test]
+fn test_obsolete_syntax_small_file() {
+    new_ucmd!()
+        .args(&["-10"])
+        .pipe_in("a\nb\nc\nd\ne\n")
+        .succeeds()
+        .stdout_is("a\nb\nc\nd\ne\n");
+}
+
 /// Test for reading all lines, specified by `tail -n +0`.
 #[test]
 fn test_positive_zero_lines() {
@@ -364,21 +403,21 @@ fn test_tail_invalid_num() {
     new_ucmd!()
         .args(&["-c", "1024R", "emptyfile.txt"])
         .fails()
-        .stderr_is("tail: invalid number of bytes: ‘1024R’");
+        .stderr_is("tail: invalid number of bytes: '1024R'");
     new_ucmd!()
         .args(&["-n", "1024R", "emptyfile.txt"])
         .fails()
-        .stderr_is("tail: invalid number of lines: ‘1024R’");
+        .stderr_is("tail: invalid number of lines: '1024R'");
     #[cfg(not(target_pointer_width = "128"))]
     new_ucmd!()
         .args(&["-c", "1Y", "emptyfile.txt"])
         .fails()
-        .stderr_is("tail: invalid number of bytes: ‘1Y’: Value too large for defined data type");
+        .stderr_is("tail: invalid number of bytes: '1Y': Value too large for defined data type");
     #[cfg(not(target_pointer_width = "128"))]
     new_ucmd!()
         .args(&["-n", "1Y", "emptyfile.txt"])
         .fails()
-        .stderr_is("tail: invalid number of lines: ‘1Y’: Value too large for defined data type");
+        .stderr_is("tail: invalid number of lines: '1Y': Value too large for defined data type");
     #[cfg(target_pointer_width = "32")]
     {
         let sizes = ["1000G", "10T"];
@@ -388,7 +427,7 @@ fn test_tail_invalid_num() {
                 .fails()
                 .code_is(1)
                 .stderr_only(format!(
-                    "tail: invalid number of bytes: ‘{}’: Value too large for defined data type",
+                    "tail: invalid number of bytes: '{}': Value too large for defined data type",
                     size
                 ));
         }
@@ -415,4 +454,24 @@ fn test_tail_num_with_undocumented_sign_bytes() {
         .pipe_in(ALPHABET)
         .succeeds()
         .stdout_is("efghijklmnopqrstuvwxyz");
+}
+
+#[test]
+#[cfg(unix)]
+fn test_tail_bytes_for_funny_files() {
+    // gnu/tests/tail-2/tail-c.sh
+    let ts = TestScenario::new(util_name!());
+    let at = &ts.fixtures;
+    for &file in &["/proc/version", "/sys/kernel/profiling"] {
+        if !at.file_exists(file) {
+            continue;
+        }
+        let args = ["--bytes", "1", file];
+        let result = ts.ucmd().args(&args).run();
+        let exp_result = unwrap_or_return!(expected_result(&ts, &args));
+        result
+            .stdout_is(exp_result.stdout_str())
+            .stderr_is(exp_result.stderr_str())
+            .code_is(exp_result.code());
+    }
 }

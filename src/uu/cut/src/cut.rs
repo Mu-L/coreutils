@@ -15,6 +15,8 @@ use clap::{crate_version, App, Arg};
 use std::fs::File;
 use std::io::{stdin, stdout, BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use uucore::display::Quotable;
+use uucore::error::{FromIo, UResult, USimpleError};
 
 use self::searcher::Searcher;
 use uucore::ranges::Range;
@@ -141,7 +143,7 @@ fn list_to_ranges(list: &str, complement: bool) -> Result<Vec<Range>, String> {
     }
 }
 
-fn cut_bytes<R: Read>(reader: R, ranges: &[Range], opts: &Options) -> i32 {
+fn cut_bytes<R: Read>(reader: R, ranges: &[Range], opts: &Options) -> UResult<()> {
     let newline_char = if opts.zero_terminated { b'\0' } else { b'\n' };
     let buf_in = BufReader::new(reader);
     let mut out = stdout_writer();
@@ -151,7 +153,7 @@ fn cut_bytes<R: Read>(reader: R, ranges: &[Range], opts: &Options) -> i32 {
         .map_or("", String::as_str)
         .as_bytes();
 
-    let res = buf_in.for_byte_record(newline_char, |line| {
+    let result = buf_in.for_byte_record(newline_char, |line| {
         let mut print_delim = false;
         for &Range { low, high } in ranges {
             if low > line.len() {
@@ -170,8 +172,12 @@ fn cut_bytes<R: Read>(reader: R, ranges: &[Range], opts: &Options) -> i32 {
         out.write_all(&[newline_char])?;
         Ok(true)
     });
-    crash_if_err!(1, res);
-    0
+
+    if let Err(e) = result {
+        return Err(USimpleError::new(1, e.to_string()));
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::cognitive_complexity)]
@@ -182,7 +188,7 @@ fn cut_fields_delimiter<R: Read>(
     only_delimited: bool,
     newline_char: u8,
     out_delim: &str,
-) -> i32 {
+) -> UResult<()> {
     let buf_in = BufReader::new(reader);
     let mut out = stdout_writer();
     let input_delim_len = delim.len();
@@ -245,12 +251,16 @@ fn cut_fields_delimiter<R: Read>(
         out.write_all(&[newline_char])?;
         Ok(true)
     });
-    crash_if_err!(1, result);
-    0
+
+    if let Err(e) = result {
+        return Err(USimpleError::new(1, e.to_string()));
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::cognitive_complexity)]
-fn cut_fields<R: Read>(reader: R, ranges: &[Range], opts: &FieldOptions) -> i32 {
+fn cut_fields<R: Read>(reader: R, ranges: &[Range], opts: &FieldOptions) -> UResult<()> {
     let newline_char = if opts.zero_terminated { b'\0' } else { b'\n' };
     if let Some(ref o_delim) = opts.out_delimiter {
         return cut_fields_delimiter(
@@ -322,13 +332,16 @@ fn cut_fields<R: Read>(reader: R, ranges: &[Range], opts: &FieldOptions) -> i32 
         out.write_all(&[newline_char])?;
         Ok(true)
     });
-    crash_if_err!(1, result);
-    0
+
+    if let Err(e) = result {
+        return Err(USimpleError::new(1, e.to_string()));
+    }
+
+    Ok(())
 }
 
-fn cut_files(mut filenames: Vec<String>, mode: Mode) -> i32 {
+fn cut_files(mut filenames: Vec<String>, mode: Mode) -> UResult<()> {
     let mut stdin_read = false;
-    let mut exit_code = 0;
 
     if filenames.is_empty() {
         filenames.push("-".to_owned());
@@ -340,43 +353,34 @@ fn cut_files(mut filenames: Vec<String>, mode: Mode) -> i32 {
                 continue;
             }
 
-            exit_code |= match mode {
+            show_if_err!(match mode {
                 Mode::Bytes(ref ranges, ref opts) => cut_bytes(stdin(), ranges, opts),
                 Mode::Characters(ref ranges, ref opts) => cut_bytes(stdin(), ranges, opts),
                 Mode::Fields(ref ranges, ref opts) => cut_fields(stdin(), ranges, opts),
-            };
+            });
 
             stdin_read = true;
         } else {
             let path = Path::new(&filename[..]);
 
             if path.is_dir() {
-                show_error!("{}: Is a directory", filename);
+                show_error!("{}: Is a directory", filename.maybe_quote());
                 continue;
             }
 
-            if path.metadata().is_err() {
-                show_error!("{}: No such file or directory", filename);
-                continue;
-            }
-
-            let file = match File::open(&path) {
-                Ok(f) => f,
-                Err(e) => {
-                    show_error!("opening '{}': {}", &filename[..], e);
-                    continue;
-                }
-            };
-
-            exit_code |= match mode {
-                Mode::Bytes(ref ranges, ref opts) => cut_bytes(file, ranges, opts),
-                Mode::Characters(ref ranges, ref opts) => cut_bytes(file, ranges, opts),
-                Mode::Fields(ref ranges, ref opts) => cut_fields(file, ranges, opts),
-            };
+            show_if_err!(File::open(&path)
+                .map_err_context(|| filename.maybe_quote().to_string())
+                .and_then(|file| {
+                    match &mode {
+                        Mode::Bytes(ref ranges, ref opts) => cut_bytes(file, ranges, opts),
+                        Mode::Characters(ref ranges, ref opts) => cut_bytes(file, ranges, opts),
+                        Mode::Fields(ref ranges, ref opts) => cut_fields(file, ranges, opts),
+                    }
+                }));
         }
     }
 
-    exit_code
+    Ok(())
 }
 
 mod options {
@@ -391,12 +395,145 @@ mod options {
     pub const FILE: &str = "file";
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().get_matches_from(args);
+
+    let complement = matches.is_present(options::COMPLEMENT);
+
+    let mode_parse = match (
+        matches.value_of(options::BYTES),
+        matches.value_of(options::CHARACTERS),
+        matches.value_of(options::FIELDS),
+    ) {
+        (Some(byte_ranges), None, None) => list_to_ranges(byte_ranges, complement).map(|ranges| {
+            Mode::Bytes(
+                ranges,
+                Options {
+                    out_delim: Some(
+                        matches
+                            .value_of(options::OUTPUT_DELIMITER)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    ),
+                    zero_terminated: matches.is_present(options::ZERO_TERMINATED),
+                },
+            )
+        }),
+        (None, Some(char_ranges), None) => list_to_ranges(char_ranges, complement).map(|ranges| {
+            Mode::Characters(
+                ranges,
+                Options {
+                    out_delim: Some(
+                        matches
+                            .value_of(options::OUTPUT_DELIMITER)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    ),
+                    zero_terminated: matches.is_present(options::ZERO_TERMINATED),
+                },
+            )
+        }),
+        (None, None, Some(field_ranges)) => {
+            list_to_ranges(field_ranges, complement).and_then(|ranges| {
+                let out_delim = match matches.value_of(options::OUTPUT_DELIMITER) {
+                    Some(s) => {
+                        if s.is_empty() {
+                            Some("\0".to_owned())
+                        } else {
+                            Some(s.to_owned())
+                        }
+                    }
+                    None => None,
+                };
+
+                let only_delimited = matches.is_present(options::ONLY_DELIMITED);
+                let zero_terminated = matches.is_present(options::ZERO_TERMINATED);
+
+                match matches.value_of(options::DELIMITER) {
+                    Some(mut delim) => {
+                        // GNU's `cut` supports `-d=` to set the delimiter to `=`.
+                        // Clap parsing is limited in this situation, see:
+                        // https://github.com/uutils/coreutils/issues/2424#issuecomment-863825242
+                        // Since clap parsing handles `-d=` as delimiter explicitly set to "" and
+                        // an empty delimiter is not accepted by GNU's `cut` (and makes no sense),
+                        // we can use this as basis for a simple workaround:
+                        if delim.is_empty() {
+                            delim = "=";
+                        }
+                        if delim.chars().count() > 1 {
+                            Err("invalid input: The '--delimiter' ('-d') option expects empty or 1 character long, but was provided a value 2 characters or longer".into())
+                        } else {
+                            let delim = if delim.is_empty() {
+                                "\0".to_owned()
+                            } else {
+                                delim.to_owned()
+                            };
+
+                            Ok(Mode::Fields(
+                                ranges,
+                                FieldOptions {
+                                    delimiter: delim,
+                                    out_delimiter: out_delim,
+                                    only_delimited,
+                                    zero_terminated,
+                                },
+                            ))
+                        }
+                    }
+                    None => Ok(Mode::Fields(
+                        ranges,
+                        FieldOptions {
+                            delimiter: "\t".to_owned(),
+                            out_delimiter: out_delim,
+                            only_delimited,
+                            zero_terminated,
+                        },
+                    )),
+                }
+            })
+        }
+        (ref b, ref c, ref f) if b.is_some() || c.is_some() || f.is_some() => Err(
+            "invalid usage: expects no more than one of --fields (-f), --chars (-c) or --bytes (-b)".into()
+        ),
+        _ => Err("invalid usage: expects one of --fields (-f), --chars (-c) or --bytes (-b)".into()),
+    };
+
+    let mode_parse = match mode_parse {
+        Err(_) => mode_parse,
+        Ok(mode) => match mode {
+            Mode::Bytes(_, _) | Mode::Characters(_, _)
+                if matches.is_present(options::DELIMITER) =>
+            {
+                Err("invalid input: The '--delimiter' ('-d') option only usable if printing a sequence of fields".into())
+            }
+            Mode::Bytes(_, _) | Mode::Characters(_, _)
+                if matches.is_present(options::ONLY_DELIMITED) =>
+            {
+                Err("invalid input: The '--only-delimited' ('-s') option only usable if printing a sequence of fields".into())
+            }
+            _ => Ok(mode),
+        },
+    };
+
+    let files: Vec<String> = matches
+        .values_of(options::FILE)
+        .unwrap_or_default()
+        .map(str::to_owned)
+        .collect();
+
+    match mode_parse {
+        Ok(mode) => cut_files(files, mode),
+        Err(e) => Err(USimpleError::new(1, e)),
+    }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .name(NAME)
         .version(crate_version!())
         .usage(SYNTAX)
@@ -477,153 +614,4 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             .hidden(true)
                 .multiple(true)
         )
-        .get_matches_from(args);
-
-    let complement = matches.is_present(options::COMPLEMENT);
-
-    let mode_parse = match (
-        matches.value_of(options::BYTES),
-        matches.value_of(options::CHARACTERS),
-        matches.value_of(options::FIELDS),
-    ) {
-        (Some(byte_ranges), None, None) => list_to_ranges(byte_ranges, complement).map(|ranges| {
-            Mode::Bytes(
-                ranges,
-                Options {
-                    out_delim: Some(
-                        matches
-                            .value_of(options::OUTPUT_DELIMITER)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    ),
-                    zero_terminated: matches.is_present(options::ZERO_TERMINATED),
-                },
-            )
-        }),
-        (None, Some(char_ranges), None) => list_to_ranges(char_ranges, complement).map(|ranges| {
-            Mode::Characters(
-                ranges,
-                Options {
-                    out_delim: Some(
-                        matches
-                            .value_of(options::OUTPUT_DELIMITER)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    ),
-                    zero_terminated: matches.is_present(options::ZERO_TERMINATED),
-                },
-            )
-        }),
-        (None, None, Some(field_ranges)) => {
-            list_to_ranges(field_ranges, complement).and_then(|ranges| {
-                let out_delim = match matches.value_of(options::OUTPUT_DELIMITER) {
-                    Some(s) => {
-                        if s.is_empty() {
-                            Some("\0".to_owned())
-                        } else {
-                            Some(s.to_owned())
-                        }
-                    }
-                    None => None,
-                };
-
-                let only_delimited = matches.is_present(options::ONLY_DELIMITED);
-                let zero_terminated = matches.is_present(options::ZERO_TERMINATED);
-
-                match matches.value_of(options::DELIMITER) {
-                    Some(mut delim) => {
-                        // GNU's `cut` supports `-d=` to set the delimiter to `=`.
-                        // Clap parsing is limited in this situation, see:
-                        // https://github.com/uutils/coreutils/issues/2424#issuecomment-863825242
-                        // Since clap parsing handles `-d=` as delimiter explicitly set to "" and
-                        // an empty delimiter is not accepted by GNU's `cut` (and makes no sense),
-                        // we can use this as basis for a simple workaround:
-                        if delim.is_empty() {
-                            delim = "=";
-                        }
-                        if delim.chars().count() > 1 {
-                            Err(msg_opt_invalid_should_be!(
-                                "empty or 1 character long",
-                                "a value 2 characters or longer",
-                                "--delimiter",
-                                "-d"
-                            ))
-                        } else {
-                            let delim = if delim.is_empty() {
-                                "\0".to_owned()
-                            } else {
-                                delim.to_owned()
-                            };
-
-                            Ok(Mode::Fields(
-                                ranges,
-                                FieldOptions {
-                                    delimiter: delim,
-                                    out_delimiter: out_delim,
-                                    only_delimited,
-                                    zero_terminated,
-                                },
-                            ))
-                        }
-                    }
-                    None => Ok(Mode::Fields(
-                        ranges,
-                        FieldOptions {
-                            delimiter: "\t".to_owned(),
-                            out_delimiter: out_delim,
-                            only_delimited,
-                            zero_terminated,
-                        },
-                    )),
-                }
-            })
-        }
-        (ref b, ref c, ref f) if b.is_some() || c.is_some() || f.is_some() => Err(
-            msg_expects_no_more_than_one_of!("--fields (-f)", "--chars (-c)", "--bytes (-b)"),
-        ),
-        _ => Err(msg_expects_one_of!(
-            "--fields (-f)",
-            "--chars (-c)",
-            "--bytes (-b)"
-        )),
-    };
-
-    let mode_parse = match mode_parse {
-        Err(_) => mode_parse,
-        Ok(mode) => match mode {
-            Mode::Bytes(_, _) | Mode::Characters(_, _)
-                if matches.is_present(options::DELIMITER) =>
-            {
-                Err(msg_opt_only_usable_if!(
-                    "printing a sequence of fields",
-                    "--delimiter",
-                    "-d"
-                ))
-            }
-            Mode::Bytes(_, _) | Mode::Characters(_, _)
-                if matches.is_present(options::ONLY_DELIMITED) =>
-            {
-                Err(msg_opt_only_usable_if!(
-                    "printing a sequence of fields",
-                    "--only-delimited",
-                    "-s"
-                ))
-            }
-            _ => Ok(mode),
-        },
-    };
-
-    let files: Vec<String> = matches
-        .values_of(options::FILE)
-        .unwrap_or_default()
-        .map(str::to_owned)
-        .collect();
-
-    match mode_parse {
-        Ok(mode) => cut_files(files, mode),
-        Err(err_msg) => {
-            show_error!("{}", err_msg);
-            1
-        }
-    }
 }

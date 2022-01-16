@@ -15,18 +15,11 @@ use std::cmp;
 use std::fs::File;
 use std::io::{stdin, stdout, Write};
 use std::io::{BufReader, BufWriter, Read};
+use uucore::display::Quotable;
+use uucore::error::{FromIo, UResult, USimpleError};
 
 use self::linebreak::break_lines;
 use self::parasplit::ParagraphStream;
-
-macro_rules! silent_unwrap(
-    ($exp:expr) => (
-        match $exp {
-            Ok(_) => (),
-            Err(_) => ::std::process::exit(1),
-        }
-    )
-);
 
 mod linebreak;
 mod parasplit;
@@ -50,8 +43,8 @@ static OPT_TAB_WIDTH: &str = "tab-width";
 
 static ARG_FILES: &str = "files";
 
-fn get_usage() -> String {
-    format!("{} [OPTION]... [FILE]...", executable!())
+fn usage() -> String {
+    format!("{} [OPTION]... [FILE]...", uucore::execution_phrase())
 }
 
 pub type FileOrStdReader = BufReader<Box<dyn Read + 'static>>;
@@ -73,133 +66,12 @@ pub struct FmtOptions {
     tabwidth: usize,
 }
 
+#[uucore_procs::gen_uumain]
 #[allow(clippy::cognitive_complexity)]
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let usage = usage();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(OPT_CROWN_MARGIN)
-                .short("c")
-                .long(OPT_CROWN_MARGIN)
-                .help(
-                    "First and second line of paragraph
-        may have different indentations, in which
-        case the first line's indentation is preserved,
-        and each subsequent line's indentation matches the second line.",
-                ),
-        )
-        .arg(
-            Arg::with_name(OPT_TAGGED_PARAGRAPH)
-                .short("t")
-                .long("tagged-paragraph")
-                .help(
-                    "Like -c, except that the first and second line of a paragraph *must*
-                    have different indentation or they are treated as separate paragraphs.",
-                ),
-        )
-        .arg(
-            Arg::with_name(OPT_PRESERVE_HEADERS)
-                .short("m")
-                .long("preserve-headers")
-                .help(
-                    "Attempt to detect and preserve mail headers in the input.
-                    Be careful when combining this flag with -p.",
-                ),
-        )
-        .arg(
-            Arg::with_name(OPT_SPLIT_ONLY)
-                .short("s")
-                .long("split-only")
-                .help("Split lines only, do not reflow."),
-        )
-        .arg(
-            Arg::with_name(OPT_UNIFORM_SPACING)
-                .short("u")
-                .long("uniform-spacing")
-                .help(
-                    "Insert exactly one
-                    space between words, and two between sentences.
-                    Sentence breaks in the input are detected as [?!.]
-                    followed by two spaces or a newline; other punctuation
-                    is not interpreted as a sentence break.",
-                ),
-        )
-        .arg(
-            Arg::with_name(OPT_PREFIX)
-                .short("p")
-                .long("prefix")
-                .help(
-                    "Reformat only lines
-                    beginning with PREFIX, reattaching PREFIX to reformatted lines.
-                    Unless -x is specified, leading whitespace will be ignored
-                    when matching PREFIX.",
-                )
-                .value_name("PREFIX"),
-        )
-        .arg(
-            Arg::with_name(OPT_SKIP_PREFIX)
-                .short("P")
-                .long("skip-prefix")
-                .help(
-                    "Do not reformat lines
-                    beginning with PSKIP. Unless -X is specified, leading whitespace
-                    will be ignored when matching PSKIP",
-                )
-                .value_name("PSKIP"),
-        )
-        .arg(
-            Arg::with_name(OPT_EXACT_PREFIX)
-                .short("x")
-                .long("exact-prefix")
-                .help(
-                    "PREFIX must match at the
-                    beginning of the line with no preceding whitespace.",
-                ),
-        )
-        .arg(
-            Arg::with_name(OPT_EXACT_SKIP_PREFIX)
-                .short("X")
-                .long("exact-skip-prefix")
-                .help(
-                    "PSKIP must match at the
-                    beginning of the line with no preceding whitespace.",
-                ),
-        )
-        .arg(
-            Arg::with_name(OPT_WIDTH)
-                .short("w")
-                .long("width")
-                .help("Fill output lines up to a maximum of WIDTH columns, default 79.")
-                .value_name("WIDTH"),
-        )
-        .arg(
-            Arg::with_name(OPT_GOAL)
-                .short("g")
-                .long("goal")
-                .help("Goal width, default ~0.94*WIDTH. Must be less than WIDTH.")
-                .value_name("GOAL"),
-        )
-        .arg(Arg::with_name(OPT_QUICK).short("q").long("quick").help(
-            "Break lines more quickly at the
-            expense of a potentially more ragged appearance.",
-        ))
-        .arg(
-            Arg::with_name(OPT_TAB_WIDTH)
-                .short("T")
-                .long("tab-width")
-                .help(
-                    "Treat tabs as TABWIDTH spaces for
-                    determining line length, default 8. Note that this is used only for
-                    calculating line lengths; tabs are preserved in the output.",
-                )
-                .value_name("TABWIDTH"),
-        )
-        .arg(Arg::with_name(ARG_FILES).multiple(true).takes_value(true))
-        .get_matches_from(args);
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
 
     let mut files: Vec<String> = matches
         .values_of(ARG_FILES)
@@ -254,15 +126,20 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         fmt_opts.width = match s.parse::<usize>() {
             Ok(t) => t,
             Err(e) => {
-                crash!(1, "Invalid WIDTH specification: `{}': {}", s, e);
+                return Err(USimpleError::new(
+                    1,
+                    format!("Invalid WIDTH specification: {}: {}", s.quote(), e),
+                ));
             }
         };
         if fmt_opts.width > MAX_WIDTH {
-            crash!(
+            return Err(USimpleError::new(
                 1,
-                "invalid width: '{}': Numerical result out of range",
-                fmt_opts.width
-            );
+                format!(
+                    "invalid width: '{}': Numerical result out of range",
+                    fmt_opts.width,
+                ),
+            ));
         }
         fmt_opts.goal = cmp::min(fmt_opts.width * 94 / 100, fmt_opts.width - 3);
     };
@@ -271,13 +148,16 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         fmt_opts.goal = match s.parse::<usize>() {
             Ok(t) => t,
             Err(e) => {
-                crash!(1, "Invalid GOAL specification: `{}': {}", s, e);
+                return Err(USimpleError::new(
+                    1,
+                    format!("Invalid GOAL specification: {}: {}", s.quote(), e),
+                ));
             }
         };
         if !matches.is_present(OPT_WIDTH) {
             fmt_opts.width = cmp::max(fmt_opts.goal * 100 / 94, fmt_opts.goal + 3);
         } else if fmt_opts.goal > fmt_opts.width {
-            crash!(1, "GOAL cannot be greater than WIDTH.");
+            return Err(USimpleError::new(1, "GOAL cannot be greater than WIDTH."));
         }
     };
 
@@ -285,7 +165,10 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         fmt_opts.tabwidth = match s.parse::<usize>() {
             Ok(t) => t,
             Err(e) => {
-                crash!(1, "Invalid TABWIDTH specification: `{}': {}", s, e);
+                return Err(USimpleError::new(
+                    1,
+                    format!("Invalid TABWIDTH specification: {}: {}", s.quote(), e),
+                ));
             }
         };
     };
@@ -309,7 +192,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             _ => match File::open(i) {
                 Ok(f) => BufReader::new(Box::new(f) as Box<dyn Read + 'static>),
                 Err(e) => {
-                    show_warning!("{}: {}", i, e);
+                    show_warning!("{}: {}", i.maybe_quote(), e);
                     continue;
                 }
             },
@@ -318,16 +201,147 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         for para_result in p_stream {
             match para_result {
                 Err(s) => {
-                    silent_unwrap!(ostream.write_all(s.as_bytes()));
-                    silent_unwrap!(ostream.write_all(b"\n"));
+                    ostream
+                        .write_all(s.as_bytes())
+                        .map_err_context(|| "failed to write output".to_string())?;
+                    ostream
+                        .write_all(b"\n")
+                        .map_err_context(|| "failed to write output".to_string())?;
                 }
-                Ok(para) => break_lines(&para, &fmt_opts, &mut ostream),
+                Ok(para) => break_lines(&para, &fmt_opts, &mut ostream)
+                    .map_err_context(|| "failed to write output".to_string())?,
             }
         }
 
         // flush the output after each file
-        silent_unwrap!(ostream.flush());
+        ostream
+            .flush()
+            .map_err_context(|| "failed to write output".to_string())?;
     }
 
-    0
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .arg(
+            Arg::with_name(OPT_CROWN_MARGIN)
+                .short("c")
+                .long(OPT_CROWN_MARGIN)
+                .help(
+                    "First and second line of paragraph \
+                    may have different indentations, in which \
+                    case the first line's indentation is preserved, \
+                    and each subsequent line's indentation matches the second line.",
+                ),
+        )
+        .arg(
+            Arg::with_name(OPT_TAGGED_PARAGRAPH)
+                .short("t")
+                .long("tagged-paragraph")
+                .help(
+                    "Like -c, except that the first and second line of a paragraph *must* \
+                    have different indentation or they are treated as separate paragraphs.",
+                ),
+        )
+        .arg(
+            Arg::with_name(OPT_PRESERVE_HEADERS)
+                .short("m")
+                .long("preserve-headers")
+                .help(
+                    "Attempt to detect and preserve mail headers in the input. \
+                    Be careful when combining this flag with -p.",
+                ),
+        )
+        .arg(
+            Arg::with_name(OPT_SPLIT_ONLY)
+                .short("s")
+                .long("split-only")
+                .help("Split lines only, do not reflow."),
+        )
+        .arg(
+            Arg::with_name(OPT_UNIFORM_SPACING)
+                .short("u")
+                .long("uniform-spacing")
+                .help(
+                    "Insert exactly one \
+                    space between words, and two between sentences. \
+                    Sentence breaks in the input are detected as [?!.] \
+                    followed by two spaces or a newline; other punctuation \
+                    is not interpreted as a sentence break.",
+                ),
+        )
+        .arg(
+            Arg::with_name(OPT_PREFIX)
+                .short("p")
+                .long("prefix")
+                .help(
+                    "Reformat only lines \
+                    beginning with PREFIX, reattaching PREFIX to reformatted lines. \
+                    Unless -x is specified, leading whitespace will be ignored \
+                    when matching PREFIX.",
+                )
+                .value_name("PREFIX"),
+        )
+        .arg(
+            Arg::with_name(OPT_SKIP_PREFIX)
+                .short("P")
+                .long("skip-prefix")
+                .help(
+                    "Do not reformat lines \
+                    beginning with PSKIP. Unless -X is specified, leading whitespace \
+                    will be ignored when matching PSKIP",
+                )
+                .value_name("PSKIP"),
+        )
+        .arg(
+            Arg::with_name(OPT_EXACT_PREFIX)
+                .short("x")
+                .long("exact-prefix")
+                .help(
+                    "PREFIX must match at the \
+                    beginning of the line with no preceding whitespace.",
+                ),
+        )
+        .arg(
+            Arg::with_name(OPT_EXACT_SKIP_PREFIX)
+                .short("X")
+                .long("exact-skip-prefix")
+                .help(
+                    "PSKIP must match at the \
+                    beginning of the line with no preceding whitespace.",
+                ),
+        )
+        .arg(
+            Arg::with_name(OPT_WIDTH)
+                .short("w")
+                .long("width")
+                .help("Fill output lines up to a maximum of WIDTH columns, default 79.")
+                .value_name("WIDTH"),
+        )
+        .arg(
+            Arg::with_name(OPT_GOAL)
+                .short("g")
+                .long("goal")
+                .help("Goal width, default ~0.94*WIDTH. Must be less than WIDTH.")
+                .value_name("GOAL"),
+        )
+        .arg(Arg::with_name(OPT_QUICK).short("q").long("quick").help(
+            "Break lines more quickly at the \
+            expense of a potentially more ragged appearance.",
+        ))
+        .arg(
+            Arg::with_name(OPT_TAB_WIDTH)
+                .short("T")
+                .long("tab-width")
+                .help(
+                    "Treat tabs as TABWIDTH spaces for \
+                    determining line length, default 8. Note that this is used only for \
+                    calculating line lengths; tabs are preserved in the output.",
+                )
+                .value_name("TABWIDTH"),
+        )
+        .arg(Arg::with_name(ARG_FILES).multiple(true).takes_value(true))
 }

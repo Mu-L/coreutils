@@ -7,13 +7,12 @@
 
 // spell-checker:ignore (ToDO) delim mkdelim
 
-#[macro_use]
-extern crate uucore;
-
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, stdin, BufRead, BufReader, Stdin};
 use std::path::Path;
+use uucore::error::FromIo;
+use uucore::error::UResult;
 use uucore::InvalidEncodingHandling;
 
 use clap::{crate_version, App, Arg, ArgMatches};
@@ -31,8 +30,8 @@ mod options {
     pub const FILE_2: &str = "FILE2";
 }
 
-fn get_usage() -> String {
-    format!("{} [OPTION]... FILE1 FILE2", executable!())
+fn usage() -> String {
+    format!("{} [OPTION]... FILE1 FILE2", uucore::execution_phrase())
 }
 
 fn mkdelim(col: usize, opts: &ArgMatches) -> String {
@@ -131,16 +130,27 @@ fn open_file(name: &str) -> io::Result<LineReader> {
     }
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let usage = usage();
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+    let filename1 = matches.value_of(options::FILE_1).unwrap();
+    let filename2 = matches.value_of(options::FILE_2).unwrap();
+    let mut f1 = open_file(filename1).map_err_context(|| filename1.to_string())?;
+    let mut f2 = open_file(filename2).map_err_context(|| filename2.to_string())?;
+
+    comm(&mut f1, &mut f2, &matches);
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
         .after_help(LONG_HELP)
         .arg(
             Arg::with_name(options::COLUMN_1)
@@ -167,12 +177,4 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         )
         .arg(Arg::with_name(options::FILE_1).required(true))
         .arg(Arg::with_name(options::FILE_2).required(true))
-        .get_matches_from(args);
-
-    let mut f1 = open_file(matches.value_of(options::FILE_1).unwrap()).unwrap();
-    let mut f2 = open_file(matches.value_of(options::FILE_2).unwrap()).unwrap();
-
-    comm(&mut f1, &mut f2, &matches);
-
-    0
 }

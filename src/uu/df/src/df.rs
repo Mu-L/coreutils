@@ -6,8 +6,8 @@
 // For the full copyright and license information, please view the LICENSE file
 // that was distributed with this source code.
 
-#[macro_use]
-extern crate uucore;
+use uucore::error::UError;
+use uucore::error::UResult;
 #[cfg(unix)]
 use uucore::fsext::statfs_fn;
 use uucore::fsext::{read_fs_list, FsUsage, MountInfo};
@@ -19,22 +19,18 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use std::error::Error;
 #[cfg(unix)]
 use std::ffi::CString;
+use std::fmt::Display;
 #[cfg(unix)]
 use std::mem;
-
-#[cfg(target_os = "freebsd")]
-use uucore::libc::{c_char, fsid_t, uid_t};
 
 #[cfg(windows)]
 use std::path::Path;
 
 static ABOUT: &str = "Show information about the file system on which each FILE resides,\n\
                       or all file systems by default.";
-
-static EXIT_OK: i32 = 0;
-static EXIT_ERR: i32 = 1;
 
 static OPT_ALL: &str = "all";
 static OPT_BLOCKSIZE: &str = "blocksize";
@@ -78,8 +74,8 @@ struct Filesystem {
     usage: FsUsage,
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... [FILE]...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... [FILE]...", uucore::execution_phrase())
 }
 
 impl FsSelector {
@@ -226,8 +222,8 @@ fn filter_mount_list(vmi: Vec<MountInfo>, paths: &[String], opt: &Options) -> Ve
 /// Convert `value` to a human readable string based on `base`.
 /// e.g. It returns 1G when value is 1 * 1024 * 1024 * 1024 and base is 1024.
 /// Note: It returns `value` if `base` isn't positive.
-fn human_readable(value: u64, base: i64) -> String {
-    match base {
+fn human_readable(value: u64, base: i64) -> UResult<String> {
+    let base_str = match base {
         d if d < 0 => value.to_string(),
 
         // ref: [Binary prefix](https://en.wikipedia.org/wiki/Binary_prefix) @@ <https://archive.is/cnwmF>
@@ -242,8 +238,10 @@ fn human_readable(value: u64, base: i64) -> String {
             NumberPrefix::Prefixed(prefix, bytes) => format!("{:.1}{}", bytes, prefix.symbol()),
         },
 
-        _ => crash!(EXIT_ERR, "Internal error: Unknown base value {}", base),
-    }
+        _ => return Err(DfError::InvalidBaseValue(base.to_string()).into()),
+    };
+
+    Ok(base_str)
 }
 
 fn use_size(free_size: u64, total_size: u64) -> String {
@@ -256,12 +254,177 @@ fn use_size(free_size: u64, total_size: u64) -> String {
     );
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
-    let matches = App::new(executable!())
+#[derive(Debug)]
+enum DfError {
+    InvalidBaseValue(String),
+}
+
+impl Display for DfError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DfError::InvalidBaseValue(s) => write!(f, "Internal error: Unknown base value {}", s),
+        }
+    }
+}
+
+impl Error for DfError {}
+
+impl UError for DfError {
+    fn code(&self) -> i32 {
+        match self {
+            DfError::InvalidBaseValue(_) => 1,
+        }
+    }
+}
+
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let usage = usage();
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+
+    let paths: Vec<String> = matches
+        .values_of(OPT_PATHS)
+        .map(|v| v.map(ToString::to_string).collect())
+        .unwrap_or_default();
+
+    #[cfg(windows)]
+    {
+        if matches.is_present(OPT_INODES) {
+            println!("{}: doesn't support -i option", uucore::util_name());
+            return Ok(());
+        }
+    }
+
+    let mut opt = Options::new();
+    if matches.is_present(OPT_LOCAL) {
+        opt.show_local_fs = true;
+    }
+    if matches.is_present(OPT_ALL) {
+        opt.show_all_fs = true;
+    }
+    if matches.is_present(OPT_INODES) {
+        opt.show_inode_instead = true;
+    }
+    if matches.is_present(OPT_PRINT_TYPE) {
+        opt.show_fs_type = true;
+    }
+    if matches.is_present(OPT_HUMAN_READABLE) {
+        opt.human_readable_base = 1024;
+    }
+    if matches.is_present(OPT_HUMAN_READABLE_2) {
+        opt.human_readable_base = 1000;
+    }
+    for fs_type in matches.values_of_lossy(OPT_TYPE).unwrap_or_default() {
+        opt.fs_selector.include(fs_type.to_owned());
+    }
+    for fs_type in matches
+        .values_of_lossy(OPT_EXCLUDE_TYPE)
+        .unwrap_or_default()
+    {
+        opt.fs_selector.exclude(fs_type.to_owned());
+    }
+
+    let fs_list = filter_mount_list(read_fs_list(), &paths, &opt)
+        .into_iter()
+        .filter_map(Filesystem::new)
+        .filter(|fs| fs.usage.blocks != 0 || opt.show_all_fs || opt.show_listed_fs)
+        .collect::<Vec<_>>();
+
+    // set headers
+    let mut header = vec!["Filesystem"];
+    if opt.show_fs_type {
+        header.push("Type");
+    }
+    header.extend_from_slice(&if opt.show_inode_instead {
+        // spell-checker:disable-next-line
+        ["Inodes", "Iused", "IFree", "IUses%"]
+    } else {
+        [
+            if opt.human_readable_base == -1 {
+                "1k-blocks"
+            } else {
+                "Size"
+            },
+            "Used",
+            "Available",
+            "Use%",
+        ]
+    });
+    if cfg!(target_os = "macos") && !opt.show_inode_instead {
+        header.insert(header.len() - 1, "Capacity");
+    }
+    header.push("Mounted on");
+
+    for (idx, title) in header.iter().enumerate() {
+        if idx == 0 || idx == header.len() - 1 {
+            print!("{0: <16} ", title);
+        } else if opt.show_fs_type && idx == 1 {
+            print!("{0: <5} ", title);
+        } else if idx == header.len() - 2 {
+            print!("{0: >5} ", title);
+        } else {
+            print!("{0: >12} ", title);
+        }
+    }
+    println!();
+    for fs in fs_list.iter() {
+        print!("{0: <16} ", fs.mount_info.dev_name);
+        if opt.show_fs_type {
+            print!("{0: <5} ", fs.mount_info.fs_type);
+        }
+        if opt.show_inode_instead {
+            print!(
+                "{0: >12} ",
+                human_readable(fs.usage.files, opt.human_readable_base)?
+            );
+            print!(
+                "{0: >12} ",
+                human_readable(fs.usage.files - fs.usage.ffree, opt.human_readable_base)?
+            );
+            print!(
+                "{0: >12} ",
+                human_readable(fs.usage.ffree, opt.human_readable_base)?
+            );
+            print!(
+                "{0: >5} ",
+                format!(
+                    "{0:.1}%",
+                    100f64 - 100f64 * (fs.usage.ffree as f64 / fs.usage.files as f64)
+                )
+            );
+        } else {
+            let total_size = fs.usage.blocksize * fs.usage.blocks;
+            let free_size = fs.usage.blocksize * fs.usage.bfree;
+            print!(
+                "{0: >12} ",
+                human_readable(total_size, opt.human_readable_base)?
+            );
+            print!(
+                "{0: >12} ",
+                human_readable(total_size - free_size, opt.human_readable_base)?
+            );
+            print!(
+                "{0: >12} ",
+                human_readable(free_size, opt.human_readable_base)?
+            );
+            if cfg!(target_os = "macos") {
+                let used = fs.usage.blocks - fs.usage.bfree;
+                let blocks = used + fs.usage.bavail;
+                print!("{0: >12} ", use_size(used, blocks));
+            }
+            print!("{0: >5} ", use_size(free_size, total_size));
+        }
+        print!("{0: <16}", fs.mount_info.mount_dir);
+        println!();
+    }
+
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
         .arg(
             Arg::with_name(OPT_ALL)
                 .short("a")
@@ -371,143 +534,4 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         )
         .arg(Arg::with_name(OPT_PATHS).multiple(true))
         .help("Filesystem(s) to list")
-        .get_matches_from(args);
-
-    let paths: Vec<String> = matches
-        .values_of(OPT_PATHS)
-        .map(|v| v.map(ToString::to_string).collect())
-        .unwrap_or_default();
-
-    #[cfg(windows)]
-    {
-        if matches.is_present(OPT_INODES) {
-            println!("{}: doesn't support -i option", executable!());
-            return EXIT_OK;
-        }
-    }
-
-    let mut opt = Options::new();
-    if matches.is_present(OPT_LOCAL) {
-        opt.show_local_fs = true;
-    }
-    if matches.is_present(OPT_ALL) {
-        opt.show_all_fs = true;
-    }
-    if matches.is_present(OPT_INODES) {
-        opt.show_inode_instead = true;
-    }
-    if matches.is_present(OPT_PRINT_TYPE) {
-        opt.show_fs_type = true;
-    }
-    if matches.is_present(OPT_HUMAN_READABLE) {
-        opt.human_readable_base = 1024;
-    }
-    if matches.is_present(OPT_HUMAN_READABLE_2) {
-        opt.human_readable_base = 1000;
-    }
-    for fs_type in matches.values_of_lossy(OPT_TYPE).unwrap_or_default() {
-        opt.fs_selector.include(fs_type.to_owned());
-    }
-    for fs_type in matches
-        .values_of_lossy(OPT_EXCLUDE_TYPE)
-        .unwrap_or_default()
-    {
-        opt.fs_selector.exclude(fs_type.to_owned());
-    }
-
-    let fs_list = filter_mount_list(read_fs_list(), &paths, &opt)
-        .into_iter()
-        .filter_map(Filesystem::new)
-        .filter(|fs| fs.usage.blocks != 0 || opt.show_all_fs || opt.show_listed_fs)
-        .collect::<Vec<_>>();
-
-    // set headers
-    let mut header = vec!["Filesystem"];
-    if opt.show_fs_type {
-        header.push("Type");
-    }
-    header.extend_from_slice(&if opt.show_inode_instead {
-        // spell-checker:disable-next-line
-        ["Inodes", "Iused", "IFree", "IUses%"]
-    } else {
-        [
-            if opt.human_readable_base == -1 {
-                "1k-blocks"
-            } else {
-                "Size"
-            },
-            "Used",
-            "Available",
-            "Use%",
-        ]
-    });
-    if cfg!(target_os = "macos") && !opt.show_inode_instead {
-        header.insert(header.len() - 1, "Capacity");
-    }
-    header.push("Mounted on");
-
-    for (idx, title) in header.iter().enumerate() {
-        if idx == 0 || idx == header.len() - 1 {
-            print!("{0: <16} ", title);
-        } else if opt.show_fs_type && idx == 1 {
-            print!("{0: <5} ", title);
-        } else if idx == header.len() - 2 {
-            print!("{0: >5} ", title);
-        } else {
-            print!("{0: >12} ", title);
-        }
-    }
-    println!();
-    for fs in fs_list.iter() {
-        print!("{0: <16} ", fs.mount_info.dev_name);
-        if opt.show_fs_type {
-            print!("{0: <5} ", fs.mount_info.fs_type);
-        }
-        if opt.show_inode_instead {
-            print!(
-                "{0: >12} ",
-                human_readable(fs.usage.files, opt.human_readable_base)
-            );
-            print!(
-                "{0: >12} ",
-                human_readable(fs.usage.files - fs.usage.ffree, opt.human_readable_base)
-            );
-            print!(
-                "{0: >12} ",
-                human_readable(fs.usage.ffree, opt.human_readable_base)
-            );
-            print!(
-                "{0: >5} ",
-                format!(
-                    "{0:.1}%",
-                    100f64 - 100f64 * (fs.usage.ffree as f64 / fs.usage.files as f64)
-                )
-            );
-        } else {
-            let total_size = fs.usage.blocksize * fs.usage.blocks;
-            let free_size = fs.usage.blocksize * fs.usage.bfree;
-            print!(
-                "{0: >12} ",
-                human_readable(total_size, opt.human_readable_base)
-            );
-            print!(
-                "{0: >12} ",
-                human_readable(total_size - free_size, opt.human_readable_base)
-            );
-            print!(
-                "{0: >12} ",
-                human_readable(free_size, opt.human_readable_base)
-            );
-            if cfg!(target_os = "macos") {
-                let used = fs.usage.blocks - fs.usage.bfree;
-                let blocks = used + fs.usage.bavail;
-                print!("{0: >12} ", use_size(used, blocks));
-            }
-            print!("{0: >5} ", use_size(free_size, total_size));
-        }
-        print!("{0: <16}", fs.mount_info.mount_dir);
-        println!();
-    }
-
-    EXIT_OK
 }

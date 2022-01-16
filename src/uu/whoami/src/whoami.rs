@@ -9,39 +9,26 @@
 
 #[macro_use]
 extern crate clap;
-#[macro_use]
-extern crate uucore;
+
+use clap::App;
+
+use uucore::display::println_verbatim;
+use uucore::error::{FromIo, UResult};
 
 mod platform;
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let app = app_from_crate!();
+static ABOUT: &str = "Print the current username.";
 
-    if let Err(err) = app.get_matches_from_safe(args) {
-        if err.kind == clap::ErrorKind::HelpDisplayed
-            || err.kind == clap::ErrorKind::VersionDisplayed
-        {
-            println!("{}", err);
-            0
-        } else {
-            show_error!("{}", err);
-            1
-        }
-    } else {
-        exec();
-
-        0
-    }
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    uu_app().get_matches_from(args);
+    let username = platform::get_username().map_err_context(|| "failed to get username".into())?;
+    println_verbatim(&username).map_err_context(|| "failed to print username".into())?;
+    Ok(())
 }
 
-pub fn exec() {
-    unsafe {
-        match platform::get_username() {
-            Ok(username) => println!("{}", username),
-            Err(err) => match err.raw_os_error() {
-                Some(0) | None => crash!(1, "failed to get username"),
-                Some(_) => crash!(1, "failed to get username: {}", err),
-            },
-        }
-    }
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
 }

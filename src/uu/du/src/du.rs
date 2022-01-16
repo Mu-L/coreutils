@@ -10,6 +10,7 @@ extern crate uucore;
 
 use chrono::prelude::DateTime;
 use chrono::Local;
+use clap::ArgMatches;
 use clap::{crate_version, App, Arg};
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -17,7 +18,7 @@ use std::env;
 use std::fs;
 #[cfg(not(windows))]
 use std::fs::Metadata;
-use std::io::{stderr, ErrorKind, Result, Write};
+use std::io::{ErrorKind, Result};
 use std::iter;
 #[cfg(not(windows))]
 use std::os::unix::fs::MetadataExt;
@@ -30,6 +31,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, UNIX_EPOCH};
+use std::{error::Error, fmt::Display};
+use uucore::display::{print_verbatim, Quotable};
+use uucore::error::{UError, UResult};
 use uucore::parse_size::{parse_size, ParseSizeError};
 use uucore::InvalidEncodingHandling;
 #[cfg(windows)]
@@ -63,10 +67,10 @@ mod options {
     pub const TIME_STYLE: &str = "time-style";
     pub const ONE_FILE_SYSTEM: &str = "one-file-system";
     pub const DEREFERENCE: &str = "dereference";
+    pub const INODES: &str = "inodes";
     pub const FILE: &str = "FILE";
 }
 
-const NAME: &str = "du";
 const SUMMARY: &str = "estimate file space usage";
 const LONG_HELP: &str = "
 Display values are in units of the first available SIZE from --block-size,
@@ -83,12 +87,13 @@ const UNITS: [(char, u32); 6] = [('E', 6), ('P', 5), ('T', 4), ('G', 3), ('M', 2
 
 struct Options {
     all: bool,
-    program_name: String,
+    util_name: String,
     max_depth: Option<usize>,
     total: bool,
     separate_dirs: bool,
     one_file_system: bool,
     dereference: bool,
+    inodes: bool,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
@@ -102,6 +107,7 @@ struct Stat {
     is_dir: bool,
     size: u64,
     blocks: u64,
+    inodes: u64,
     inode: Option<FileInfo>,
     created: Option<u64>,
     accessed: u64,
@@ -127,6 +133,7 @@ impl Stat {
             is_dir: metadata.is_dir(),
             size: metadata.len(),
             blocks: metadata.blocks() as u64,
+            inodes: 1,
             inode: Some(file_info),
             created: birth_u64(&metadata),
             accessed: metadata.atime() as u64,
@@ -144,6 +151,7 @@ impl Stat {
             size: metadata.len(),
             blocks: size_on_disk / 1024 * 2,
             inode: file_info,
+            inodes: 1,
             created: windows_creation_time_to_unix_time(metadata.creation_time()),
             accessed: windows_time_to_unix_time(metadata.last_access_time()),
             modified: windows_time_to_unix_time(metadata.last_write_time()),
@@ -257,6 +265,18 @@ fn read_block_size(s: Option<&str>) -> usize {
     }
 }
 
+fn choose_size(matches: &ArgMatches, stat: &Stat) -> u64 {
+    if matches.is_present(options::INODES) {
+        stat.inodes
+    } else if matches.is_present(options::APPARENT_SIZE) || matches.is_present(options::BYTES) {
+        stat.size
+    } else {
+        // The st_blocks field indicates the number of blocks allocated to the file, 512-byte units.
+        // See: http://linux.die.net/man/2/stat
+        stat.blocks * 512
+    }
+}
+
 // this takes `my_stat` to avoid having to stat files multiple times.
 // XXX: this should use the impl Trait return type when it is stabilized
 fn du(
@@ -272,11 +292,10 @@ fn du(
         let read = match fs::read_dir(&my_stat.path) {
             Ok(read) => read,
             Err(e) => {
-                safe_writeln!(
-                    stderr(),
-                    "{}: cannot read directory ‘{}‘: {}",
-                    options.program_name,
-                    my_stat.path.display(),
+                eprintln!(
+                    "{}: cannot read directory {}: {}",
+                    options.util_name,
+                    my_stat.path.quote(),
                     e
                 );
                 return Box::new(iter::once(my_stat));
@@ -307,6 +326,7 @@ fn du(
                         } else {
                             my_stat.size += this_stat.size;
                             my_stat.blocks += this_stat.blocks;
+                            my_stat.inodes += 1;
                             if options.all {
                                 stats.push(this_stat);
                             }
@@ -314,13 +334,11 @@ fn du(
                     }
                     Err(error) => match error.kind() {
                         ErrorKind::PermissionDenied => {
-                            let description = format!("cannot access '{}'", entry.path().display());
+                            let description = format!("cannot access {}", entry.path().quote());
                             let error_message = "Permission denied";
                             show_error_custom_description!(description, "{}", error_message)
                         }
-                        _ => {
-                            show_error!("cannot access '{}': {}", entry.path().display(), error)
-                        }
+                        _ => show_error!("cannot access {}: {}", entry.path().quote(), error),
                     },
                 },
                 Err(error) => show_error!("{}", error),
@@ -332,6 +350,7 @@ fn du(
         if !options.separate_dirs && stat.path.parent().unwrap() == my_stat.path {
             my_stat.size += stat.size;
             my_stat.blocks += stat.blocks;
+            my_stat.inodes += stat.inodes;
         }
         options
             .max_depth
@@ -373,26 +392,243 @@ fn convert_size_other(size: u64, _multiplier: u64, block_size: u64) -> String {
     format!("{}", ((size as f64) / (block_size as f64)).ceil())
 }
 
-fn get_usage() -> String {
+fn usage() -> String {
     format!(
         "{0} [OPTION]... [FILE]...
     {0} [OPTION]... --files0-from=F",
-        executable!()
+        uucore::execution_phrase()
     )
 }
 
+#[derive(Debug)]
+enum DuError {
+    InvalidMaxDepthArg(String),
+    SummarizeDepthConflict(String),
+    InvalidTimeStyleArg(String),
+    InvalidTimeArg(String),
+}
+
+impl Display for DuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DuError::InvalidMaxDepthArg(s) => write!(f, "invalid maximum depth {}", s.quote()),
+            DuError::SummarizeDepthConflict(s) => {
+                write!(
+                    f,
+                    "summarizing conflicts with --max-depth={}",
+                    s.maybe_quote()
+                )
+            }
+            DuError::InvalidTimeStyleArg(s) => write!(
+                f,
+                "invalid argument {} for 'time style'
+Valid arguments are:
+- 'full-iso'
+- 'long-iso'
+- 'iso'
+Try '{} --help' for more information.",
+                s.quote(),
+                uucore::execution_phrase()
+            ),
+            DuError::InvalidTimeArg(s) => write!(
+                f,
+                "Invalid argument {} for --time.
+'birth' and 'creation' arguments are not supported on this platform.",
+                s.quote()
+            ),
+        }
+    }
+}
+
+impl Error for DuError {}
+
+impl UError for DuError {
+    fn code(&self) -> i32 {
+        match self {
+            Self::InvalidMaxDepthArg(_) => 1,
+            Self::SummarizeDepthConflict(_) => 1,
+            Self::InvalidTimeStyleArg(_) => 1,
+            Self::InvalidTimeArg(_) => 1,
+        }
+    }
+}
+
+#[uucore_procs::gen_uumain]
 #[allow(clippy::cognitive_complexity)]
-pub fn uumain(args: impl uucore::Args) -> i32 {
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let usage = get_usage();
+    let usage = usage();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+
+    let summarize = matches.is_present(options::SUMMARIZE);
+
+    let max_depth = parse_depth(matches.value_of(options::MAX_DEPTH), summarize)?;
+
+    let options = Options {
+        all: matches.is_present(options::ALL),
+        util_name: uucore::util_name().to_owned(),
+        max_depth,
+        total: matches.is_present(options::TOTAL),
+        separate_dirs: matches.is_present(options::SEPARATE_DIRS),
+        one_file_system: matches.is_present(options::ONE_FILE_SYSTEM),
+        dereference: matches.is_present(options::DEREFERENCE),
+        inodes: matches.is_present(options::INODES),
+    };
+
+    let files = match matches.value_of(options::FILE) {
+        Some(_) => matches.values_of(options::FILE).unwrap().collect(),
+        None => vec!["."],
+    };
+
+    if options.inodes
+        && (matches.is_present(options::APPARENT_SIZE) || matches.is_present(options::BYTES))
+    {
+        show_warning!("options --apparent-size and -b are ineffective with --inodes")
+    }
+
+    let block_size = u64::try_from(read_block_size(matches.value_of(options::BLOCK_SIZE))).unwrap();
+
+    let threshold = matches.value_of(options::THRESHOLD).map(|s| {
+        Threshold::from_str(s)
+            .unwrap_or_else(|e| crash!(1, "{}", format_error_message(e, s, options::THRESHOLD)))
+    });
+
+    let multiplier: u64 = if matches.is_present(options::SI) {
+        1000
+    } else {
+        1024
+    };
+    let convert_size_fn = {
+        if matches.is_present(options::HUMAN_READABLE) || matches.is_present(options::SI) {
+            convert_size_human
+        } else if matches.is_present(options::BYTES) {
+            convert_size_b
+        } else if matches.is_present(options::BLOCK_SIZE_1K) {
+            convert_size_k
+        } else if matches.is_present(options::BLOCK_SIZE_1M) {
+            convert_size_m
+        } else {
+            convert_size_other
+        }
+    };
+    let convert_size = |size: u64| {
+        if options.inodes {
+            size.to_string()
+        } else {
+            convert_size_fn(size, multiplier, block_size)
+        }
+    };
+
+    let time_format_str = parse_time_style(matches.value_of("time-style"))?;
+
+    let line_separator = if matches.is_present(options::NULL) {
+        "\0"
+    } else {
+        "\n"
+    };
+
+    let mut grand_total = 0;
+    for path_string in files {
+        let path = PathBuf::from(&path_string);
+        match Stat::new(path, &options) {
+            Ok(stat) => {
+                let mut inodes: HashSet<FileInfo> = HashSet::new();
+                if let Some(inode) = stat.inode {
+                    inodes.insert(inode);
+                }
+                let iter = du(stat, &options, 0, &mut inodes);
+                let (_, len) = iter.size_hint();
+                let len = len.unwrap();
+                for (index, stat) in iter.enumerate() {
+                    let size = choose_size(&matches, &stat);
+
+                    if threshold.map_or(false, |threshold| threshold.should_exclude(size)) {
+                        continue;
+                    }
+
+                    if matches.is_present(options::TIME) {
+                        let tm = {
+                            let secs = {
+                                match matches.value_of(options::TIME) {
+                                    Some(s) => match s {
+                                        "ctime" | "status" => stat.modified,
+                                        "access" | "atime" | "use" => stat.accessed,
+                                        "birth" | "creation" => stat
+                                            .created
+                                            .ok_or_else(|| DuError::InvalidTimeArg(s.into()))?,
+                                        // below should never happen as clap already restricts the values.
+                                        _ => unreachable!("Invalid field for --time"),
+                                    },
+                                    None => stat.modified,
+                                }
+                            };
+                            DateTime::<Local>::from(UNIX_EPOCH + Duration::from_secs(secs))
+                        };
+                        if !summarize || index == len - 1 {
+                            let time_str = tm.format(time_format_str).to_string();
+                            print!("{}\t{}\t", convert_size(size), time_str);
+                            print_verbatim(stat.path).unwrap();
+                            print!("{}", line_separator);
+                        }
+                    } else if !summarize || index == len - 1 {
+                        print!("{}\t", convert_size(size));
+                        print_verbatim(stat.path).unwrap();
+                        print!("{}", line_separator);
+                    }
+                    if options.total && index == (len - 1) {
+                        // The last element will be the total size of the the path under
+                        // path_string.  We add it to the grand total.
+                        grand_total += size;
+                    }
+                }
+            }
+            Err(_) => {
+                show_error!(
+                    "{}: {}",
+                    path_string.maybe_quote(),
+                    "No such file or directory"
+                );
+            }
+        }
+    }
+
+    if options.total {
+        print!("{}\ttotal", convert_size(grand_total));
+        print!("{}", line_separator);
+    }
+
+    Ok(())
+}
+
+fn parse_time_style(s: Option<&str>) -> UResult<&str> {
+    match s {
+        Some(s) => match s {
+            "full-iso" => Ok("%Y-%m-%d %H:%M:%S.%f %z"),
+            "long-iso" => Ok("%Y-%m-%d %H:%M"),
+            "iso" => Ok("%Y-%m-%d"),
+            _ => Err(DuError::InvalidTimeStyleArg(s.into()).into()),
+        },
+        None => Ok("%Y-%m-%d %H:%M"),
+    }
+}
+
+fn parse_depth(max_depth_str: Option<&str>, summarize: bool) -> UResult<Option<usize>> {
+    let max_depth = max_depth_str.as_ref().and_then(|s| s.parse::<usize>().ok());
+    match (max_depth_str, max_depth) {
+        (Some(s), _) if summarize => Err(DuError::SummarizeDepthConflict(s.into()).into()),
+        (Some(s), None) => Err(DuError::InvalidMaxDepthArg(s.into()).into()),
+        (Some(_), Some(_)) | (None, _) => Ok(max_depth),
+    }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(SUMMARY)
-        .usage(&usage[..])
         .after_help(LONG_HELP)
         .arg(
             Arg::with_name(options::ALL)
@@ -450,8 +686,8 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .help("print sizes in human readable format (e.g., 1K 234M 2G)")
         )
         .arg(
-            Arg::with_name("inodes")
-                .long("inodes")
+            Arg::with_name(options::INODES)
+                .long(options::INODES)
                 .help(
                     "list inode usage information instead of block usage like --block-size=1K"
                 )
@@ -564,187 +800,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .hidden(true)
                 .multiple(true)
         )
-        .get_matches_from(args);
-
-    let summarize = matches.is_present(options::SUMMARIZE);
-
-    let max_depth_str = matches.value_of(options::MAX_DEPTH);
-    let max_depth = max_depth_str.as_ref().and_then(|s| s.parse::<usize>().ok());
-    match (max_depth_str, max_depth) {
-        (Some(s), _) if summarize => {
-            show_error!("summarizing conflicts with --max-depth={}", s);
-            return 1;
-        }
-        (Some(s), None) => {
-            show_error!("invalid maximum depth '{}'", s);
-            return 1;
-        }
-        (Some(_), Some(_)) | (None, _) => { /* valid */ }
-    }
-
-    let options = Options {
-        all: matches.is_present(options::ALL),
-        program_name: NAME.to_owned(),
-        max_depth,
-        total: matches.is_present(options::TOTAL),
-        separate_dirs: matches.is_present(options::SEPARATE_DIRS),
-        one_file_system: matches.is_present(options::ONE_FILE_SYSTEM),
-        dereference: matches.is_present(options::DEREFERENCE),
-    };
-
-    let files = match matches.value_of(options::FILE) {
-        Some(_) => matches.values_of(options::FILE).unwrap().collect(),
-        None => {
-            vec!["."]
-        }
-    };
-
-    let block_size = u64::try_from(read_block_size(matches.value_of(options::BLOCK_SIZE))).unwrap();
-
-    let threshold = matches.value_of(options::THRESHOLD).map(|s| {
-        Threshold::from_str(s)
-            .unwrap_or_else(|e| crash!(1, "{}", format_error_message(e, s, options::THRESHOLD)))
-    });
-
-    let multiplier: u64 = if matches.is_present(options::SI) {
-        1000
-    } else {
-        1024
-    };
-    let convert_size_fn = {
-        if matches.is_present(options::HUMAN_READABLE) || matches.is_present(options::SI) {
-            convert_size_human
-        } else if matches.is_present(options::BYTES) {
-            convert_size_b
-        } else if matches.is_present(options::BLOCK_SIZE_1K) {
-            convert_size_k
-        } else if matches.is_present(options::BLOCK_SIZE_1M) {
-            convert_size_m
-        } else {
-            convert_size_other
-        }
-    };
-    let convert_size = |size| convert_size_fn(size, multiplier, block_size);
-
-    let time_format_str = match matches.value_of("time-style") {
-        Some(s) => match s {
-            "full-iso" => "%Y-%m-%d %H:%M:%S.%f %z",
-            "long-iso" => "%Y-%m-%d %H:%M",
-            "iso" => "%Y-%m-%d",
-            _ => {
-                show_error!(
-                    "invalid argument '{}' for 'time style'
-Valid arguments are:
-- 'full-iso'
-- 'long-iso'
-- 'iso'
-Try '{} --help' for more information.",
-                    s,
-                    NAME
-                );
-                return 1;
-            }
-        },
-        None => "%Y-%m-%d %H:%M",
-    };
-
-    let line_separator = if matches.is_present(options::NULL) {
-        "\0"
-    } else {
-        "\n"
-    };
-
-    let mut grand_total = 0;
-    for path_string in files {
-        let path = PathBuf::from(&path_string);
-        match Stat::new(path, &options) {
-            Ok(stat) => {
-                let mut inodes: HashSet<FileInfo> = HashSet::new();
-                if let Some(inode) = stat.inode {
-                    inodes.insert(inode);
-                }
-                let iter = du(stat, &options, 0, &mut inodes);
-                let (_, len) = iter.size_hint();
-                let len = len.unwrap();
-                for (index, stat) in iter.enumerate() {
-                    let size = if matches.is_present(options::APPARENT_SIZE)
-                        || matches.is_present(options::BYTES)
-                    {
-                        stat.size
-                    } else {
-                        // C's stat is such that each block is assume to be 512 bytes
-                        // See: http://linux.die.net/man/2/stat
-                        stat.blocks * 512
-                    };
-
-                    if threshold.map_or(false, |threshold| threshold.should_exclude(size)) {
-                        continue;
-                    }
-
-                    if matches.is_present(options::TIME) {
-                        let tm = {
-                            let secs = {
-                                match matches.value_of(options::TIME) {
-                                    Some(s) => match s {
-                                        "ctime" | "status" => stat.modified,
-                                        "access" | "atime" | "use" => stat.accessed,
-                                        "birth" | "creation" => {
-                                            if let Some(time) = stat.created {
-                                                time
-                                            } else {
-                                                show_error!(
-                                                    "Invalid argument ‘{}‘ for --time.
-‘birth‘ and ‘creation‘ arguments are not supported on this platform.",
-                                                    s
-                                                );
-                                                return 1;
-                                            }
-                                        }
-                                        // below should never happen as clap already restricts the values.
-                                        _ => unreachable!("Invalid field for --time"),
-                                    },
-                                    None => stat.modified,
-                                }
-                            };
-                            DateTime::<Local>::from(UNIX_EPOCH + Duration::from_secs(secs))
-                        };
-                        if !summarize || index == len - 1 {
-                            let time_str = tm.format(time_format_str).to_string();
-                            print!(
-                                "{}\t{}\t{}{}",
-                                convert_size(size),
-                                time_str,
-                                stat.path.display(),
-                                line_separator
-                            );
-                        }
-                    } else if !summarize || index == len - 1 {
-                        print!(
-                            "{}\t{}{}",
-                            convert_size(size),
-                            stat.path.display(),
-                            line_separator
-                        );
-                    }
-                    if options.total && index == (len - 1) {
-                        // The last element will be the total size of the the path under
-                        // path_string.  We add it to the grand total.
-                        grand_total += size;
-                    }
-                }
-            }
-            Err(_) => {
-                show_error!("{}: {}", path_string, "No such file or directory");
-            }
-        }
-    }
-
-    if options.total {
-        print!("{}\ttotal", convert_size(grand_total));
-        print!("{}", line_separator);
-    }
-
-    0
 }
 
 #[derive(Clone, Copy)]
@@ -783,8 +838,8 @@ fn format_error_message(error: ParseSizeError, s: &str, option: &str) -> String 
     // GNU's du echos affected flag, -B or --block-size (-t or --threshold), depending user's selection
     // GNU's du does distinguish between "invalid (suffix in) argument"
     match error {
-        ParseSizeError::ParseFailure(_) => format!("invalid --{} argument '{}'", option, s),
-        ParseSizeError::SizeTooBig(_) => format!("--{} argument '{}' too large", option, s),
+        ParseSizeError::ParseFailure(_) => format!("invalid --{} argument {}", option, s.quote()),
+        ParseSizeError::SizeTooBig(_) => format!("--{} argument {} too large", option, s.quote()),
     }
 }
 

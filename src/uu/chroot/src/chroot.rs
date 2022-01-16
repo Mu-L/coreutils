@@ -7,18 +7,18 @@
 // file that was distributed with this source code.
 
 // spell-checker:ignore (ToDO) NEWROOT Userspec pstatus
+mod error;
 
-#[macro_use]
-extern crate uucore;
+use crate::error::ChrootError;
 use clap::{crate_version, App, Arg};
 use std::ffi::CString;
 use std::io::Error;
 use std::path::Path;
 use std::process::Command;
+use uucore::error::{set_exit_code, UResult};
 use uucore::libc::{self, chroot, setgid, setgroups, setuid};
 use uucore::{entries, InvalidEncodingHandling};
 
-static NAME: &str = "chroot";
 static ABOUT: &str = "Run COMMAND with root directory set to NEWROOT.";
 static SYNTAX: &str = "[OPTION]... NEWROOT [COMMAND [ARG]...]";
 
@@ -31,12 +31,68 @@ mod options {
     pub const COMMAND: &str = "command";
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().get_matches_from(args);
+
+    let default_shell: &'static str = "/bin/sh";
+    let default_option: &'static str = "-i";
+    let user_shell = std::env::var("SHELL");
+
+    let newroot: &Path = match matches.value_of(options::NEWROOT) {
+        Some(v) => Path::new(v),
+        None => return Err(ChrootError::MissingNewRoot.into()),
+    };
+
+    if !newroot.is_dir() {
+        return Err(ChrootError::NoSuchDirectory(format!("{}", newroot.display())).into());
+    }
+
+    let commands = match matches.values_of(options::COMMAND) {
+        Some(v) => v.collect(),
+        None => vec![],
+    };
+
+    // TODO: refactor the args and command matching
+    // See: https://github.com/uutils/coreutils/pull/2365#discussion_r647849967
+    let command: Vec<&str> = match commands.len() {
+        0 => {
+            let shell: &str = match user_shell {
+                Err(_) => default_shell,
+                Ok(ref s) => s.as_ref(),
+            };
+            vec![shell, default_option]
+        }
+        _ => commands,
+    };
+
+    assert!(!command.is_empty());
+    let chroot_command = command[0];
+    let chroot_args = &command[1..];
+
+    // NOTE: Tests can only trigger code beyond this point if they're invoked with root permissions
+    set_context(newroot, &matches)?;
+
+    let pstatus = match Command::new(chroot_command).args(chroot_args).status() {
+        Ok(status) => status,
+        Err(e) => return Err(ChrootError::CommandFailed(command[0].to_string(), e).into()),
+    };
+
+    let code = if pstatus.success() {
+        0
+    } else {
+        pstatus.code().unwrap_or(-1)
+    };
+    set_exit_code(code);
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
         .usage(SYNTAX)
@@ -83,62 +139,9 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .multiple(true)
                 .index(2),
         )
-        .get_matches_from(args);
-
-    let default_shell: &'static str = "/bin/sh";
-    let default_option: &'static str = "-i";
-    let user_shell = std::env::var("SHELL");
-
-    let newroot: &Path = match matches.value_of(options::NEWROOT) {
-        Some(v) => Path::new(v),
-        None => crash!(
-            1,
-            "Missing operand: NEWROOT\nTry '{} --help' for more information.",
-            NAME
-        ),
-    };
-
-    if !newroot.is_dir() {
-        crash!(
-            1,
-            "cannot change root directory to `{}`: no such directory",
-            newroot.display()
-        );
-    }
-
-    let commands = match matches.values_of(options::COMMAND) {
-        Some(v) => v.collect(),
-        None => vec![],
-    };
-
-    // TODO: refactor the args and command matching
-    // See: https://github.com/uutils/coreutils/pull/2365#discussion_r647849967
-    let command: Vec<&str> = match commands.len() {
-        1 => {
-            let shell: &str = match user_shell {
-                Err(_) => default_shell,
-                Ok(ref s) => s.as_ref(),
-            };
-            vec![shell, default_option]
-        }
-        _ => commands,
-    };
-
-    set_context(newroot, &matches);
-
-    let pstatus = Command::new(command[0])
-        .args(&command[1..])
-        .status()
-        .unwrap_or_else(|e| crash!(1, "Cannot exec: {}", e));
-
-    if pstatus.success() {
-        0
-    } else {
-        pstatus.code().unwrap_or(-1)
-    }
 }
 
-fn set_context(root: &Path, options: &clap::ArgMatches) {
+fn set_context(root: &Path, options: &clap::ArgMatches) -> UResult<()> {
     let userspec_str = options.value_of(options::USERSPEC);
     let user_str = options.value_of(options::USER).unwrap_or_default();
     let group_str = options.value_of(options::GROUP).unwrap_or_default();
@@ -147,7 +150,7 @@ fn set_context(root: &Path, options: &clap::ArgMatches) {
         Some(u) => {
             let s: Vec<&str> = u.split(':').collect();
             if s.len() != 2 || s.iter().any(|&spec| spec.is_empty()) {
-                crash!(1, "invalid userspec: `{}`", u)
+                return Err(ChrootError::InvalidUserspec(u.to_string()).into());
             };
             s
         }
@@ -160,45 +163,40 @@ fn set_context(root: &Path, options: &clap::ArgMatches) {
         (userspec[0], userspec[1])
     };
 
-    enter_chroot(root);
+    enter_chroot(root)?;
 
-    set_groups_from_str(groups_str);
-    set_main_group(group);
-    set_user(user);
+    set_groups_from_str(groups_str)?;
+    set_main_group(group)?;
+    set_user(user)?;
+    Ok(())
 }
 
-fn enter_chroot(root: &Path) {
-    let root_str = root.display();
+fn enter_chroot(root: &Path) -> UResult<()> {
     std::env::set_current_dir(root).unwrap();
     let err = unsafe {
         chroot(CString::new(".").unwrap().as_bytes_with_nul().as_ptr() as *const libc::c_char)
     };
-    if err != 0 {
-        crash!(
-            1,
-            "cannot chroot to {}: {}",
-            root_str,
-            Error::last_os_error()
-        )
-    };
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(ChrootError::CannotEnter(format!("{}", root.display()), Error::last_os_error()).into())
+    }
 }
 
-fn set_main_group(group: &str) {
+fn set_main_group(group: &str) -> UResult<()> {
     if !group.is_empty() {
         let group_id = match entries::grp2gid(group) {
             Ok(g) => g,
-            _ => crash!(1, "no such group: {}", group),
+            _ => return Err(ChrootError::NoSuchGroup(group.to_string()).into()),
         };
         let err = unsafe { setgid(group_id) };
         if err != 0 {
-            crash!(
-                1,
-                "cannot set gid to {}: {}",
-                group_id,
-                Error::last_os_error()
-            )
+            return Err(
+                ChrootError::SetGidFailed(group_id.to_string(), Error::last_os_error()).into(),
+            );
         }
     }
+    Ok(())
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
@@ -211,28 +209,33 @@ fn set_groups(groups: Vec<libc::gid_t>) -> libc::c_int {
     unsafe { setgroups(groups.len() as libc::size_t, groups.as_ptr()) }
 }
 
-fn set_groups_from_str(groups: &str) {
+fn set_groups_from_str(groups: &str) -> UResult<()> {
     if !groups.is_empty() {
-        let groups_vec: Vec<libc::gid_t> = groups
-            .split(',')
-            .map(|x| match entries::grp2gid(x) {
+        let mut groups_vec = vec![];
+        for group in groups.split(',') {
+            let gid = match entries::grp2gid(group) {
                 Ok(g) => g,
-                _ => crash!(1, "no such group: {}", x),
-            })
-            .collect();
+                Err(_) => return Err(ChrootError::NoSuchGroup(group.to_string()).into()),
+            };
+            groups_vec.push(gid);
+        }
         let err = set_groups(groups_vec);
         if err != 0 {
-            crash!(1, "cannot set groups: {}", Error::last_os_error())
+            return Err(ChrootError::SetGroupsFailed(Error::last_os_error()).into());
         }
     }
+    Ok(())
 }
 
-fn set_user(user: &str) {
+fn set_user(user: &str) -> UResult<()> {
     if !user.is_empty() {
         let user_id = entries::usr2uid(user).unwrap();
         let err = unsafe { setuid(user_id as libc::uid_t) };
         if err != 0 {
-            crash!(1, "cannot set user to {}: {}", user, Error::last_os_error())
+            return Err(
+                ChrootError::SetUserFailed(user.to_string(), Error::last_os_error()).into(),
+            );
         }
     }
+    Ok(())
 }

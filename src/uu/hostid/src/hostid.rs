@@ -7,28 +7,28 @@
 
 // spell-checker:ignore (ToDO) gethostid
 
-#[macro_use]
-extern crate uucore;
-
+use clap::{crate_version, App};
 use libc::c_long;
-use uucore::InvalidEncodingHandling;
+use uucore::error::UResult;
 
 static SYNTAX: &str = "[options]";
-static SUMMARY: &str = "";
-static LONG_HELP: &str = "";
 
 // currently rust libc interface doesn't include gethostid
 extern "C" {
     pub fn gethostid() -> c_long;
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    app!(SYNTAX, SUMMARY, LONG_HELP).parse(
-        args.collect_str(InvalidEncodingHandling::ConvertLossy)
-            .accept_any(),
-    );
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    uu_app().get_matches_from(args);
     hostid();
-    0
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .usage(SYNTAX)
 }
 
 fn hostid() {

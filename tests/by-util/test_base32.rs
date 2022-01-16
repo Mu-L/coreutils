@@ -85,11 +85,15 @@ fn test_wrap() {
 #[test]
 fn test_wrap_no_arg() {
     for wrap_param in &["-w", "--wrap"] {
-        let expected_stderr = "error: The argument '--wrap <wrap>\' requires a value but none was \
-                               supplied\n\nUSAGE:\n    base32 [OPTION]... [FILE]\n\nFor more \
-                               information try --help"
-            .to_string();
-        new_ucmd!()
+        let ts = TestScenario::new(util_name!());
+        let expected_stderr = &format!(
+            "error: The argument '--wrap <wrap>\' requires a value but none was \
+                               supplied\n\nUSAGE:\n    {1} {0} [OPTION]... [FILE]\n\nFor more \
+                               information try --help",
+            ts.util_name,
+            ts.bin_path.to_string_lossy()
+        );
+        ts.ucmd()
             .arg(wrap_param)
             .fails()
             .stderr_only(expected_stderr);
@@ -103,7 +107,7 @@ fn test_wrap_bad_arg() {
             .arg(wrap_param)
             .arg("b")
             .fails()
-            .stderr_only("base32: Invalid wrap size: ‘b’: invalid digit found in string\n");
+            .stderr_only("base32: invalid wrap size: 'b'\n");
     }
 }
 
@@ -112,9 +116,9 @@ fn test_base32_extra_operand() {
     // Expect a failure when multiple files are specified.
     new_ucmd!()
         .arg("a.txt")
-        .arg("a.txt")
+        .arg("b.txt")
         .fails()
-        .stderr_only("base32: extra operand ‘a.txt’");
+        .usage_error("extra operand 'b.txt'");
 }
 
 #[test]

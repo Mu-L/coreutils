@@ -2,14 +2,16 @@
 // spell-checker:ignore (change!) each's
 // spell-checker:ignore (ToDO) LONGHELP FORMATSTRING templating parameterizing formatstr
 
+use clap::{crate_version, App, Arg};
+use uucore::error::{UResult, UUsageError};
 use uucore::InvalidEncodingHandling;
 
 mod cli;
 mod memo;
 mod tokenize;
 
-static NAME: &str = "printf";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION: &str = "version";
+const HELP: &str = "help";
 static LONGHELP_LEAD: &str = "printf
 
  USAGE: printf FORMATSTRING [ARGUMENT]...
@@ -272,28 +274,30 @@ COPYRIGHT :
 
 ";
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let location = &args[0];
     if args.len() <= 1 {
-        println!(
-            "{0}: missing operand\nTry '{0} --help' for more information.",
-            location
-        );
-        return 1;
+        return Err(UUsageError::new(1, "missing operand"));
     }
     let formatstr = &args[1];
 
     if formatstr == "--help" {
         print!("{} {}", LONGHELP_LEAD, LONGHELP_BODY);
     } else if formatstr == "--version" {
-        println!("{} {}", NAME, VERSION);
+        println!("{} {}", uucore::util_name(), crate_version!());
     } else {
         let printf_args = &args[2..];
         memo::Memo::run_all(formatstr, printf_args);
     }
-    0
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .arg(Arg::with_name(VERSION).long(VERSION))
+        .arg(Arg::with_name(HELP).long(HELP))
 }

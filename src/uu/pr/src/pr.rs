@@ -20,9 +20,12 @@ use quick_error::ResultExt;
 use regex::Regex;
 use std::convert::From;
 use std::fs::{metadata, File};
-use std::io::{stdin, stdout, BufRead, BufReader, Lines, Read, Stdout, Write};
+use std::io::{stdin, stdout, BufRead, BufReader, Lines, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
+
+use uucore::display::Quotable;
+use uucore::error::UResult;
 
 type IOError = std::io::Error;
 
@@ -167,7 +170,13 @@ quick_error! {
     }
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+pub fn uu_app() -> clap::App<'static, 'static> {
+    // TODO: migrate to clap to get more shell completions
+    clap::App::new(uucore::util_name())
+}
+
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(uucore::InvalidEncodingHandling::Ignore)
         .accept_any();
@@ -381,7 +390,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
 
     if matches.opt_present("version") {
         println!("{} {}", NAME, VERSION);
-        return 0;
+        return Ok(());
     }
 
     let mut files = matches.free.clone();
@@ -405,7 +414,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             Ok(options) => options,
             Err(err) => {
                 print_error(&matches, err);
-                return 1;
+                return Err(1.into());
             }
         };
 
@@ -423,11 +432,10 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             _ => 0,
         };
         if status != 0 {
-            return status;
+            return Err(status.into());
         }
     }
-
-    0
+    Ok(())
 }
 
 /// Returns re-written arguments which are passed to the program.
@@ -463,7 +471,7 @@ fn print_error(matches: &Matches, err: PrError) {
     }
 }
 
-fn print_usage(opts: &mut getopts::Options, matches: &Matches) -> i32 {
+fn print_usage(opts: &mut getopts::Options, matches: &Matches) -> UResult<()> {
     println!("{} {} -- print files", NAME, VERSION);
     println!();
     println!(
@@ -501,10 +509,9 @@ fn print_usage(opts: &mut getopts::Options, matches: &Matches) -> i32 {
         options::COLUMN_OPTION
     );
     if matches.free.is_empty() {
-        return 1;
+        return Err(1.into());
     }
-
-    0
+    Ok(())
 }
 
 fn parse_usize(matches: &Matches, opt: &str) -> Option<Result<usize, PrError>> {
@@ -512,7 +519,7 @@ fn parse_usize(matches: &Matches, opt: &str) -> Option<Result<usize, PrError>> {
         let i = value_to_parse.0;
         let option = value_to_parse.1;
         i.parse().map_err(|_e| {
-            PrError::EncounteredErrors(format!("invalid {} argument '{}'", option, i))
+            PrError::EncounteredErrors(format!("invalid {} argument {}", option, i.quote()))
         })
     };
     matches
@@ -614,7 +621,7 @@ fn build_options(
         let unparsed_num = i.get(1).unwrap().as_str().trim();
         let x: Vec<_> = unparsed_num.split(':').collect();
         x[0].to_string().parse::<usize>().map_err(|_e| {
-            PrError::EncounteredErrors(format!("invalid {} argument '{}'", "+", unparsed_num))
+            PrError::EncounteredErrors(format!("invalid {} argument {}", "+", unparsed_num.quote()))
         })
     }) {
         Some(res) => res?,
@@ -628,7 +635,11 @@ fn build_options(
         .map(|unparsed_num| {
             let x: Vec<_> = unparsed_num.split(':').collect();
             x[1].to_string().parse::<usize>().map_err(|_e| {
-                PrError::EncounteredErrors(format!("invalid {} argument '{}'", "+", unparsed_num))
+                PrError::EncounteredErrors(format!(
+                    "invalid {} argument {}",
+                    "+",
+                    unparsed_num.quote()
+                ))
             })
         }) {
         Some(res) => Some(res?),
@@ -638,7 +649,10 @@ fn build_options(
     let invalid_pages_map = |i: String| {
         let unparsed_value = matches.opt_str(options::PAGE_RANGE_OPTION).unwrap();
         i.parse::<usize>().map_err(|_e| {
-            PrError::EncounteredErrors(format!("invalid --pages argument '{}'", unparsed_value))
+            PrError::EncounteredErrors(format!(
+                "invalid --pages argument {}",
+                unparsed_value.quote()
+            ))
         })
     };
 
@@ -736,7 +750,7 @@ fn build_options(
     let start_column_option = match re_col.captures(&free_args).map(|i| {
         let unparsed_num = i.get(1).unwrap().as_str().trim();
         unparsed_num.parse::<usize>().map_err(|_e| {
-            PrError::EncounteredErrors(format!("invalid {} argument '{}'", "-", unparsed_num))
+            PrError::EncounteredErrors(format!("invalid {} argument {}", "-", unparsed_num.quote()))
         })
     }) {
         Some(res) => Some(res?),
@@ -902,8 +916,7 @@ fn read_stream_and_create_pages(
 
     Box::new(
         lines
-            .map(split_lines_if_form_feed)
-            .flatten()
+            .flat_map(split_lines_if_form_feed)
             .enumerate()
             .map(move |(i, line)| FileLine {
                 line_number: i + start_line_number,
@@ -968,20 +981,18 @@ fn mpr(paths: &[String], options: &OutputOptions) -> Result<i32, PrError> {
         .map(|(i, path)| {
             let lines = BufReader::with_capacity(READ_BUFFER_SIZE, open(path).unwrap()).lines();
 
-            read_stream_and_create_pages(options, lines, i)
-                .map(move |(x, line)| {
-                    let file_line = line;
-                    let page_number = x + 1;
-                    file_line
-                        .into_iter()
-                        .map(|fl| FileLine {
-                            page_number,
-                            group_key: page_number * n_files + fl.file_id,
-                            ..fl
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .flatten()
+            read_stream_and_create_pages(options, lines, i).flat_map(move |(x, line)| {
+                let file_line = line;
+                let page_number = x + 1;
+                file_line
+                    .into_iter()
+                    .map(|fl| FileLine {
+                        page_number,
+                        group_key: page_number * n_files + fl.file_id,
+                        ..fl
+                    })
+                    .collect::<Vec<_>>()
+            })
         })
         .kmerge_by(|a, b| {
             if a.group_key == b.group_key {
@@ -1022,15 +1033,16 @@ fn print_page(lines: &[FileLine], options: &OutputOptions, page: usize) -> Resul
 
     let header = header_content(options, page);
     let trailer_content = trailer_content(options);
-    let out = &mut stdout();
 
-    out.lock();
+    let out = stdout();
+    let mut out = out.lock();
+
     for x in header {
         out.write_all(x.as_bytes())?;
         out.write_all(line_separator)?;
     }
 
-    let lines_written = write_columns(lines, options, out)?;
+    let lines_written = write_columns(lines, options, &mut out)?;
 
     for (index, x) in trailer_content.iter().enumerate() {
         out.write_all(x.as_bytes())?;
@@ -1046,7 +1058,7 @@ fn print_page(lines: &[FileLine], options: &OutputOptions, page: usize) -> Resul
 fn write_columns(
     lines: &[FileLine],
     options: &OutputOptions,
-    out: &mut Stdout,
+    out: &mut impl Write,
 ) -> Result<usize, IOError> {
     let line_separator = options.content_line_separator.as_bytes();
 

@@ -7,7 +7,9 @@ use std::fs::set_permissions;
 #[cfg(not(windows))]
 use std::os::unix::fs;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+use std::os::unix::fs::symlink as symlink_file;
+#[cfg(all(unix, not(target_os = "freebsd")))]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::symlink_file;
@@ -16,8 +18,6 @@ use std::os::windows::fs::symlink_file;
 use filetime::FileTime;
 #[cfg(target_os = "linux")]
 use rlimit::Resource;
-#[cfg(not(windows))]
-use std::env;
 #[cfg(target_os = "linux")]
 use std::fs as std_fs;
 #[cfg(target_os = "linux")]
@@ -563,14 +563,13 @@ fn test_cp_backup_off() {
 
 #[test]
 fn test_cp_backup_no_clobber_conflicting_options() {
-    let (_, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg("--backup")
+    new_ucmd!()
+        .arg("--backup")
         .arg("--no-clobber")
         .arg(TEST_HELLO_WORLD_SOURCE)
         .arg(TEST_HOW_ARE_YOU_SOURCE)
         .fails()
-        .stderr_is("cp: options --backup and --no-clobber are mutually exclusive\nTry 'cp --help' for more information.");
+        .usage_error("options --backup and --no-clobber are mutually exclusive");
 }
 
 #[test]
@@ -727,6 +726,21 @@ fn test_cp_parents_dest_not_directory() {
 }
 
 #[test]
+#[cfg(unix)]
+fn test_cp_writable_special_file_permissions() {
+    new_ucmd!().arg("/dev/null").arg("/dev/zero").succeeds();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_cp_issue_1665() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    ucmd.arg("/dev/null").arg("foo").succeeds();
+    assert!(at.file_exists("foo"));
+    assert_eq!(at.read("foo"), "");
+}
+
+#[test]
 fn test_cp_preserve_no_args() {
     new_ucmd!()
         .arg(TEST_COPY_FROM_FOLDER_FILE)
@@ -743,20 +757,16 @@ fn test_cp_deref_folder_to_folder() {
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
 
-    let cwd = env::current_dir().unwrap();
+    let path_to_new_symlink = at.plus(TEST_COPY_FROM_FOLDER);
 
-    let path_to_new_symlink = at.subdir.join(TEST_COPY_FROM_FOLDER);
-
-    // Change the cwd to have a correct symlink
-    assert!(env::set_current_dir(&path_to_new_symlink).is_ok());
-
-    #[cfg(not(windows))]
-    let _r = fs::symlink(TEST_HELLO_WORLD_SOURCE, TEST_HELLO_WORLD_SOURCE_SYMLINK);
-    #[cfg(windows)]
-    let _r = symlink_file(TEST_HELLO_WORLD_SOURCE, TEST_HELLO_WORLD_SOURCE_SYMLINK);
-
-    // Back to the initial cwd (breaks the other tests)
-    assert!(env::set_current_dir(&cwd).is_ok());
+    at.symlink_file(
+        &path_to_new_symlink
+            .join(TEST_HELLO_WORLD_SOURCE)
+            .to_string_lossy(),
+        &path_to_new_symlink
+            .join(TEST_HELLO_WORLD_SOURCE_SYMLINK)
+            .to_string_lossy(),
+    );
 
     //using -P -R option
     scene
@@ -843,20 +853,16 @@ fn test_cp_no_deref_folder_to_folder() {
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
 
-    let cwd = env::current_dir().unwrap();
+    let path_to_new_symlink = at.plus(TEST_COPY_FROM_FOLDER);
 
-    let path_to_new_symlink = at.subdir.join(TEST_COPY_FROM_FOLDER);
-
-    // Change the cwd to have a correct symlink
-    assert!(env::set_current_dir(&path_to_new_symlink).is_ok());
-
-    #[cfg(not(windows))]
-    let _r = fs::symlink(TEST_HELLO_WORLD_SOURCE, TEST_HELLO_WORLD_SOURCE_SYMLINK);
-    #[cfg(windows)]
-    let _r = symlink_file(TEST_HELLO_WORLD_SOURCE, TEST_HELLO_WORLD_SOURCE_SYMLINK);
-
-    // Back to the initial cwd (breaks the other tests)
-    assert!(env::set_current_dir(&cwd).is_ok());
+    at.symlink_file(
+        &path_to_new_symlink
+            .join(TEST_HELLO_WORLD_SOURCE)
+            .to_string_lossy(),
+        &path_to_new_symlink
+            .join(TEST_HELLO_WORLD_SOURCE_SYMLINK)
+            .to_string_lossy(),
+    );
 
     //using -P -R option
     scene
@@ -969,10 +975,9 @@ fn test_cp_archive() {
 }
 
 #[test]
-#[cfg(target_os = "unix")]
+#[cfg(unix)]
 fn test_cp_archive_recursive() {
     let (at, mut ucmd) = at_and_ucmd!();
-    let cwd = env::current_dir().unwrap();
 
     // creates
     // dir/1
@@ -988,26 +993,13 @@ fn test_cp_archive_recursive() {
     at.touch(&file_1.to_string_lossy());
     at.touch(&file_2.to_string_lossy());
 
-    // Change the cwd to have a correct symlink
-    assert!(env::set_current_dir(&at.subdir.join(TEST_COPY_TO_FOLDER)).is_ok());
-
-    #[cfg(not(windows))]
-    {
-        let _r = fs::symlink("1", &file_1_link);
-        let _r = fs::symlink("2", &file_2_link);
-    }
-    #[cfg(windows)]
-    {
-        let _r = symlink_file("1", &file_1_link);
-        let _r = symlink_file("2", &file_2_link);
-    }
-    // Back to the initial cwd (breaks the other tests)
-    assert!(env::set_current_dir(&cwd).is_ok());
+    at.symlink_file("1", &file_1_link.to_string_lossy());
+    at.symlink_file("2", &file_2_link.to_string_lossy());
 
     ucmd.arg("--archive")
         .arg(TEST_COPY_TO_FOLDER)
         .arg(TEST_COPY_TO_FOLDER_NEW)
-        .fails(); // fails for now
+        .succeeds();
 
     let scene2 = TestScenario::new("ls");
     let result = scene2
@@ -1025,18 +1017,6 @@ fn test_cp_archive_recursive() {
         .run();
 
     println!("ls dest {}", result.stdout_str());
-    assert!(at.file_exists(
-        &at.subdir
-            .join(TEST_COPY_TO_FOLDER_NEW)
-            .join("1.link")
-            .to_string_lossy()
-    ));
-    assert!(at.file_exists(
-        &at.subdir
-            .join(TEST_COPY_TO_FOLDER_NEW)
-            .join("2.link")
-            .to_string_lossy()
-    ));
     assert!(at.file_exists(
         &at.subdir
             .join(TEST_COPY_TO_FOLDER_NEW)
@@ -1324,4 +1304,117 @@ fn test_copy_dir_with_symlinks() {
 
     ucmd.args(&["-r", "dir", "copy"]).succeeds();
     assert_eq!(at.resolve_link("copy/file-link"), "file");
+}
+
+#[test]
+#[cfg(not(windows))]
+fn test_copy_symlink_force() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("file");
+    at.symlink_file("file", "file-link");
+    at.touch("copy");
+
+    ucmd.args(&["file-link", "copy", "-f", "--no-dereference"])
+        .succeeds();
+    assert_eq!(at.resolve_link("copy"), "file");
+}
+
+#[test]
+#[cfg(all(unix, not(target_os = "freebsd")))]
+fn test_no_preserve_mode() {
+    use std::os::unix::prelude::MetadataExt;
+
+    use uucore::mode::get_umask;
+
+    const PERMS_ALL: u32 = 0o7777;
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("file");
+    set_permissions(at.plus("file"), PermissionsExt::from_mode(PERMS_ALL)).unwrap();
+    ucmd.arg("file")
+        .arg("dest")
+        .succeeds()
+        .no_stderr()
+        .no_stdout();
+    let umask = get_umask();
+    // remove sticky bit, setuid and setgid bit; apply umask
+    let expected_perms = PERMS_ALL & !0o7000 & !umask;
+    assert_eq!(
+        at.plus("dest").metadata().unwrap().mode() & 0o7777,
+        expected_perms
+    );
+}
+
+#[test]
+#[cfg(all(unix, not(target_os = "freebsd")))]
+fn test_preserve_mode() {
+    use std::os::unix::prelude::MetadataExt;
+
+    const PERMS_ALL: u32 = 0o7777;
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("file");
+    set_permissions(at.plus("file"), PermissionsExt::from_mode(PERMS_ALL)).unwrap();
+    ucmd.arg("file")
+        .arg("dest")
+        .arg("-p")
+        .succeeds()
+        .no_stderr()
+        .no_stdout();
+    assert_eq!(
+        at.plus("dest").metadata().unwrap().mode() & 0o7777,
+        PERMS_ALL
+    );
+}
+
+#[test]
+fn test_canonicalize_symlink() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir");
+    at.touch("dir/file");
+    symlink_file("../dir/file", at.plus("dir/file-ln")).unwrap();
+    ucmd.arg("dir/file-ln")
+        .arg(".")
+        .succeeds()
+        .no_stderr()
+        .no_stdout();
+}
+
+#[test]
+fn test_copy_through_just_created_symlink() {
+    for &create_t in &[true, false] {
+        let (at, mut ucmd) = at_and_ucmd!();
+        at.mkdir("a");
+        at.mkdir("b");
+        at.mkdir("c");
+        #[cfg(unix)]
+        fs::symlink("../t", at.plus("a/1")).unwrap();
+        #[cfg(target_os = "windows")]
+        symlink_file("../t", at.plus("a/1")).unwrap();
+        at.touch("b/1");
+        if create_t {
+            at.touch("t");
+        }
+        ucmd.arg("--no-dereference")
+            .arg("a/1")
+            .arg("b/1")
+            .arg("c")
+            .fails()
+            .stderr_only(if cfg!(not(target_os = "windows")) {
+                "cp: will not copy 'b/1' through just-created symlink 'c/1'"
+            } else {
+                "cp: will not copy 'b/1' through just-created symlink 'c\\1'"
+            });
+    }
+}
+
+#[test]
+fn test_copy_through_dangling_symlink() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("file");
+    at.symlink_file("nonexistent", "target");
+    ucmd.arg("file")
+        .arg("target")
+        .fails()
+        .stderr_only("cp: not writing through dangling symlink 'target'");
 }

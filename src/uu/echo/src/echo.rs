@@ -6,13 +6,11 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-#[macro_use]
-extern crate uucore;
-
 use clap::{crate_version, App, Arg};
 use std::io::{self, Write};
 use std::iter::Peekable;
 use std::str::Chars;
+use uucore::error::{FromIo, UResult};
 use uucore::InvalidEncodingHandling;
 
 const NAME: &str = "echo";
@@ -113,11 +111,25 @@ fn print_escaped(input: &str, mut output: impl Write) -> io::Result<bool> {
     Ok(should_stop)
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
-    let matches = App::new(executable!())
+    let matches = uu_app().get_matches_from(args);
+
+    let no_newline = matches.is_present(options::NO_NEWLINE);
+    let escaped = matches.is_present(options::ENABLE_BACKSLASH_ESCAPE);
+    let values: Vec<String> = match matches.values_of(options::STRING) {
+        Some(s) => s.map(|s| s.to_string()).collect(),
+        None => vec!["".to_string()],
+    };
+
+    execute(no_newline, escaped, values).map_err_context(|| "could not write to stdout".to_string())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .name(NAME)
         // TrailingVarArg specifies the final positional argument is a VarArg
         // and it doesn't attempts the parse any further args.
@@ -154,22 +166,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .multiple(true)
                 .allow_hyphen_values(true),
         )
-        .get_matches_from(args);
-
-    let no_newline = matches.is_present(options::NO_NEWLINE);
-    let escaped = matches.is_present(options::ENABLE_BACKSLASH_ESCAPE);
-    let values: Vec<String> = match matches.values_of(options::STRING) {
-        Some(s) => s.map(|s| s.to_string()).collect(),
-        None => vec!["".to_string()],
-    };
-
-    match execute(no_newline, escaped, values) {
-        Ok(_) => 0,
-        Err(f) => {
-            show_error!("{}", f);
-            1
-        }
-    }
 }
 
 fn execute(no_newline: bool, escaped: bool, free: Vec<String>) -> io::Result<()> {

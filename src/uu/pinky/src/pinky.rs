@@ -7,9 +7,8 @@
 
 // spell-checker:ignore (ToDO) BUFSIZE gecos fullname, mesg iobuf
 
-#[macro_use]
-extern crate uucore;
 use uucore::entries::{Locate, Passwd};
+use uucore::error::{FromIo, UResult};
 use uucore::libc::S_IWGRP;
 use uucore::utmpx::{self, time, Utmpx};
 
@@ -40,8 +39,8 @@ mod options {
     pub const USER: &str = "user";
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... [USER]...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... [USER]...", uucore::execution_phrase())
 }
 
 fn get_long_usage() -> String {
@@ -52,70 +51,18 @@ fn get_long_usage() -> String {
     )
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let usage = get_usage();
+    let usage = usage();
     let after_help = get_long_usage();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
+    let matches = uu_app()
         .usage(&usage[..])
         .after_help(&after_help[..])
-        .arg(
-            Arg::with_name(options::LONG_FORMAT)
-                .short("l")
-                .requires(options::USER)
-                .help("produce long format output for the specified USERs"),
-        )
-        .arg(
-            Arg::with_name(options::OMIT_HOME_DIR)
-                .short("b")
-                .help("omit the user's home directory and shell in long format"),
-        )
-        .arg(
-            Arg::with_name(options::OMIT_PROJECT_FILE)
-                .short("h")
-                .help("omit the user's project file in long format"),
-        )
-        .arg(
-            Arg::with_name(options::OMIT_PLAN_FILE)
-                .short("p")
-                .help("omit the user's plan file in long format"),
-        )
-        .arg(
-            Arg::with_name(options::SHORT_FORMAT)
-                .short("s")
-                .help("do short format output, this is the default"),
-        )
-        .arg(
-            Arg::with_name(options::OMIT_HEADINGS)
-                .short("f")
-                .help("omit the line of column headings in short format"),
-        )
-        .arg(
-            Arg::with_name(options::OMIT_NAME)
-                .short("w")
-                .help("omit the user's full name in short format"),
-        )
-        .arg(
-            Arg::with_name(options::OMIT_NAME_HOST)
-                .short("i")
-                .help("omit the user's full name and remote host in short format"),
-        )
-        .arg(
-            Arg::with_name(options::OMIT_NAME_HOST_TIME)
-                .short("q")
-                .help("omit the user's full name, remote host and idle time in short format"),
-        )
-        .arg(
-            Arg::with_name(options::USER)
-                .takes_value(true)
-                .multiple(true),
-        )
         .get_matches_from(args);
 
     let users: Vec<String> = matches
@@ -175,11 +122,71 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     };
 
     if do_short_format {
-        pk.short_pinky();
-        0
+        match pk.short_pinky() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.map_err_context(String::new)),
+        }
     } else {
-        pk.long_pinky()
+        pk.long_pinky();
+        Ok(())
     }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .arg(
+            Arg::with_name(options::LONG_FORMAT)
+                .short("l")
+                .requires(options::USER)
+                .help("produce long format output for the specified USERs"),
+        )
+        .arg(
+            Arg::with_name(options::OMIT_HOME_DIR)
+                .short("b")
+                .help("omit the user's home directory and shell in long format"),
+        )
+        .arg(
+            Arg::with_name(options::OMIT_PROJECT_FILE)
+                .short("h")
+                .help("omit the user's project file in long format"),
+        )
+        .arg(
+            Arg::with_name(options::OMIT_PLAN_FILE)
+                .short("p")
+                .help("omit the user's plan file in long format"),
+        )
+        .arg(
+            Arg::with_name(options::SHORT_FORMAT)
+                .short("s")
+                .help("do short format output, this is the default"),
+        )
+        .arg(
+            Arg::with_name(options::OMIT_HEADINGS)
+                .short("f")
+                .help("omit the line of column headings in short format"),
+        )
+        .arg(
+            Arg::with_name(options::OMIT_NAME)
+                .short("w")
+                .help("omit the user's full name in short format"),
+        )
+        .arg(
+            Arg::with_name(options::OMIT_NAME_HOST)
+                .short("i")
+                .help("omit the user's full name and remote host in short format"),
+        )
+        .arg(
+            Arg::with_name(options::OMIT_NAME_HOST_TIME)
+                .short("q")
+                .help("omit the user's full name, remote host and idle time in short format"),
+        )
+        .arg(
+            Arg::with_name(options::USER)
+                .takes_value(true)
+                .multiple(true),
+        )
 }
 
 struct Pinky {
@@ -234,11 +241,11 @@ fn idle_string(when: i64) -> String {
 }
 
 fn time_string(ut: &Utmpx) -> String {
-    time::strftime("%Y-%m-%d %H:%M", &ut.login_time()).unwrap()
+    time::strftime("%b %e %H:%M", &ut.login_time()).unwrap() // LC_ALL=C
 }
 
 impl Pinky {
-    fn print_entry(&self, ut: &Utmpx) {
+    fn print_entry(&self, ut: &Utmpx) -> std::io::Result<()> {
         let mut pts_path = PathBuf::from("/dev");
         pts_path.push(ut.tty_device().as_str());
 
@@ -263,11 +270,11 @@ impl Pinky {
 
         if self.include_fullname {
             if let Ok(pw) = Passwd::locate(ut.user().as_ref()) {
-                let mut gecos = pw.user_info().into_owned();
+                let mut gecos = pw.user_info;
                 if let Some(n) = gecos.find(',') {
                     gecos.truncate(n + 1);
                 }
-                print!(" {:<19.19}", gecos.replace("&", &pw.name().capitalize()));
+                print!(" {:<19.19}", gecos.replace("&", &pw.name.capitalize()));
             } else {
                 print!(" {:19}", "        ???");
             }
@@ -287,11 +294,12 @@ impl Pinky {
 
         let mut s = ut.host();
         if self.include_where && !s.is_empty() {
-            s = safe_unwrap!(ut.canon_host());
+            s = ut.canon_host()?;
             print!(" {}", s);
         }
 
         println!();
+        Ok(())
     }
 
     fn print_heading(&self) {
@@ -310,32 +318,33 @@ impl Pinky {
         println!();
     }
 
-    fn short_pinky(&self) {
+    fn short_pinky(&self) -> std::io::Result<()> {
         if self.include_heading {
             self.print_heading();
         }
         for ut in Utmpx::iter_all_records() {
             if ut.is_user_process() {
                 if self.names.is_empty() {
-                    self.print_entry(&ut)
+                    self.print_entry(&ut)?
                 } else if self.names.iter().any(|n| n.as_str() == ut.user()) {
-                    self.print_entry(&ut);
+                    self.print_entry(&ut)?;
                 }
             }
         }
+        Ok(())
     }
 
-    fn long_pinky(&self) -> i32 {
+    fn long_pinky(&self) {
         for u in &self.names {
             print!("Login name: {:<28}In real life: ", u);
             if let Ok(pw) = Passwd::locate(u.as_str()) {
-                println!(" {}", pw.user_info().replace("&", &pw.name().capitalize()));
+                println!(" {}", pw.user_info.replace("&", &pw.name.capitalize()));
                 if self.include_home_and_shell {
-                    print!("Directory: {:<29}", pw.user_dir());
-                    println!("Shell:  {}", pw.user_shell());
+                    print!("Directory: {:<29}", pw.user_dir);
+                    println!("Shell:  {}", pw.user_shell);
                 }
                 if self.include_project {
-                    let mut p = PathBuf::from(pw.user_dir().as_ref());
+                    let mut p = PathBuf::from(&pw.user_dir);
                     p.push(".project");
                     if let Ok(f) = File::open(p) {
                         print!("Project: ");
@@ -343,7 +352,7 @@ impl Pinky {
                     }
                 }
                 if self.include_plan {
-                    let mut p = PathBuf::from(pw.user_dir().as_ref());
+                    let mut p = PathBuf::from(&pw.user_dir);
                     p.push(".plan");
                     if let Ok(f) = File::open(p) {
                         println!("Plan:");
@@ -355,7 +364,6 @@ impl Pinky {
                 println!(" ???");
             }
         }
-        0
     }
 }
 

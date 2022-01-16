@@ -16,14 +16,19 @@ use clap::{crate_version, App, AppSettings, Arg};
 use std::io::ErrorKind;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use uucore::display::Quotable;
+use uucore::error::{UResult, USimpleError};
 use uucore::process::ChildExt;
 use uucore::signals::{signal_by_name_or_value, signal_name_by_value};
 use uucore::InvalidEncodingHandling;
 
 static ABOUT: &str = "Start COMMAND, and kill it if still running after DURATION.";
 
-fn get_usage() -> String {
-    format!("{0} [OPTION] DURATION COMMAND...", executable!())
+fn usage() -> String {
+    format!(
+        "{0} [OPTION] DURATION COMMAND...",
+        uucore::execution_phrase()
+    )
 }
 
 const ERR_EXIT_STATUS: i32 = 125;
@@ -58,7 +63,7 @@ impl Config {
                 let signal_result = signal_by_name_or_value(signal_);
                 match signal_result {
                     None => {
-                        unreachable!("invalid signal '{}'", signal_);
+                        unreachable!("invalid signal {}", signal_.quote());
                     }
                     Some(signal_value) => signal_value,
                 }
@@ -89,22 +94,39 @@ impl Config {
             signal,
             duration,
             preserve_status,
-            command,
             verbose,
+            command,
         }
     }
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
-    let usage = get_usage();
+    let usage = usage();
 
-    let app = App::new("timeout")
+    let app = uu_app().usage(&usage[..]);
+
+    let matches = app.get_matches_from(args);
+
+    let config = Config::from(matches);
+    timeout(
+        &config.command,
+        config.duration,
+        config.signal,
+        config.kill_after,
+        config.foreground,
+        config.preserve_status,
+        config.verbose,
+    )
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new("timeout")
         .version(crate_version!())
-        .usage(&usage[..])
         .about(ABOUT)
         .arg(
             Arg::with_name(options::FOREGROUND)
@@ -144,20 +166,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .required(true)
                 .multiple(true)
         )
-        .setting(AppSettings::TrailingVarArg);
-
-    let matches = app.get_matches_from(args);
-
-    let config = Config::from(matches);
-    timeout(
-        &config.command,
-        config.duration,
-        config.signal,
-        config.kill_after,
-        config.foreground,
-        config.preserve_status,
-        config.verbose,
-    )
+        .setting(AppSettings::TrailingVarArg)
 }
 
 /// Remove pre-existing SIGCHLD handlers that would make waiting for the child's exit code fail.
@@ -181,72 +190,88 @@ fn timeout(
     foreground: bool,
     preserve_status: bool,
     verbose: bool,
-) -> i32 {
+) -> UResult<()> {
     if !foreground {
         unsafe { libc::setpgid(0, 0) };
     }
-    let mut process = match Command::new(&cmd[0])
+    let mut process = Command::new(&cmd[0])
         .args(&cmd[1..])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-    {
-        Ok(p) => p,
-        Err(err) => {
-            show_error!("failed to execute process: {}", err);
-            if err.kind() == ErrorKind::NotFound {
+        .map_err(|err| {
+            let status_code = if err.kind() == ErrorKind::NotFound {
                 // FIXME: not sure which to use
-                return 127;
+                127
             } else {
                 // FIXME: this may not be 100% correct...
-                return 126;
-            }
-        }
-    };
+                126
+            };
+            USimpleError::new(status_code, format!("failed to execute process: {}", err))
+        })?;
     unblock_sigchld();
     match process.wait_or_timeout(duration) {
-        Ok(Some(status)) => status.code().unwrap_or_else(|| status.signal().unwrap()),
+        Ok(Some(status)) => {
+            let status_code = status.code().unwrap_or_else(|| status.signal().unwrap());
+            if status_code == 0 {
+                Ok(())
+            } else {
+                Err(status_code.into())
+            }
+        }
         Ok(None) => {
             if verbose {
                 show_error!(
-                    "sending signal {} to command '{}'",
+                    "sending signal {} to command {}",
                     signal_name_by_value(signal).unwrap(),
-                    cmd[0]
+                    cmd[0].quote()
                 );
             }
-            return_if_err!(ERR_EXIT_STATUS, process.send_signal(signal));
+            process
+                .send_signal(signal)
+                .map_err(|e| USimpleError::new(ERR_EXIT_STATUS, format!("{}", e)))?;
             if let Some(kill_after) = kill_after {
                 match process.wait_or_timeout(kill_after) {
                     Ok(Some(status)) => {
                         if preserve_status {
-                            status.code().unwrap_or_else(|| status.signal().unwrap())
+                            let status_code =
+                                status.code().unwrap_or_else(|| status.signal().unwrap());
+                            if status_code == 0 {
+                                Ok(())
+                            } else {
+                                Err(status_code.into())
+                            }
                         } else {
-                            124
+                            Err(124.into())
                         }
                     }
                     Ok(None) => {
                         if verbose {
-                            show_error!("sending signal KILL to command '{}'", cmd[0]);
+                            show_error!("sending signal KILL to command {}", cmd[0].quote());
                         }
-                        return_if_err!(
-                            ERR_EXIT_STATUS,
-                            process.send_signal(
-                                uucore::signals::signal_by_name_or_value("KILL").unwrap()
-                            )
-                        );
-                        return_if_err!(ERR_EXIT_STATUS, process.wait());
-                        137
+                        process
+                            .send_signal(uucore::signals::signal_by_name_or_value("KILL").unwrap())
+                            .map_err(|e| USimpleError::new(ERR_EXIT_STATUS, format!("{}", e)))?;
+                        process
+                            .wait()
+                            .map_err(|e| USimpleError::new(ERR_EXIT_STATUS, format!("{}", e)))?;
+                        Err(137.into())
                     }
-                    Err(_) => 124,
+                    Err(_) => Err(124.into()),
                 }
             } else {
-                124
+                Err(124.into())
             }
         }
         Err(_) => {
-            return_if_err!(ERR_EXIT_STATUS, process.send_signal(signal));
-            ERR_EXIT_STATUS
+            // We're going to return ERR_EXIT_STATUS regardless of
+            // whether `send_signal()` succeeds or fails, so just
+            // ignore the return value.
+            process
+                .send_signal(signal)
+                .map_err(|e| USimpleError::new(ERR_EXIT_STATUS, format!("{}", e)))?;
+            Err(ERR_EXIT_STATUS.into())
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "uu_head"
-version = "0.0.6"
+version = "0.0.9"
 authors = ["uutils developers"]
 license = "MIT"
 description = "head ~ (uutils) display the first lines of input"
@@ -15,10 +15,14 @@ edition = "2018"
 path = "src/head.rs"
 
 [dependencies]
-clap = "2.33"
-uucore = { version=">=0.0.8", package="uucore", path="../../uucore", features=["ringbuffer"] }
-uucore_procs = { version=">=0.0.5", package="uucore_procs", path="../../uucore_procs" }
+clap = { version = "2.33", features = ["wrap_help"] }
+memchr = "2"
+uucore = { version=">=0.0.11", package="uucore", path="../../uucore", features=["ringbuffer"] }
+uucore_procs = { version=">=0.0.8", package="uucore_procs", path="../../uucore_procs" }
 
 [[bin]]
 name = "head"
 path = "src/main.rs"
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["uucore_procs"]

@@ -12,7 +12,9 @@ use clap::{crate_version, App, Arg};
 use retain_mut::RetainMut;
 use std::fs::OpenOptions;
 use std::io::{copy, sink, stdin, stdout, Error, ErrorKind, Read, Result, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use uucore::display::Quotable;
+use uucore::error::UResult;
 
 #[cfg(unix)]
 use uucore::libc;
@@ -32,17 +34,35 @@ struct Options {
     files: Vec<String>,
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... [FILE]...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... [FILE]...", uucore::execution_phrase())
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let usage = usage();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+
+    let options = Options {
+        append: matches.is_present(options::APPEND),
+        ignore_interrupts: matches.is_present(options::IGNORE_INTERRUPTS),
+        files: matches
+            .values_of(options::FILE)
+            .map(|v| v.map(ToString::to_string).collect())
+            .unwrap_or_default(),
+    };
+
+    match tee(options) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(1.into()),
+    }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
         .after_help("If a FILE is -, it refers to a file named - .")
         .arg(
             Arg::with_name(options::APPEND)
@@ -57,21 +77,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .help("ignore interrupt signals (ignored on non-Unix platforms)"),
         )
         .arg(Arg::with_name(options::FILE).multiple(true))
-        .get_matches_from(args);
-
-    let options = Options {
-        append: matches.is_present(options::APPEND),
-        ignore_interrupts: matches.is_present(options::IGNORE_INTERRUPTS),
-        files: matches
-            .values_of(options::FILE)
-            .map(|v| v.map(ToString::to_string).collect())
-            .unwrap_or_default(),
-    };
-
-    match tee(options) {
-        Ok(_) => 0,
-        Err(_) => 1,
-    }
 }
 
 #[cfg(unix)]
@@ -161,11 +166,11 @@ impl MultiWriter {
 
 impl Write for MultiWriter {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        self.writers.retain_mut(|writer| {
+        RetainMut::retain_mut(&mut self.writers, |writer| {
             let result = writer.write_all(buf);
             match result {
                 Err(f) => {
-                    show_error!("{}: {}", writer.name, f.to_string());
+                    show_error!("{}: {}", writer.name.maybe_quote(), f);
                     false
                 }
                 _ => true,
@@ -175,11 +180,11 @@ impl Write for MultiWriter {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.writers.retain_mut(|writer| {
+        RetainMut::retain_mut(&mut self.writers, |writer| {
             let result = writer.flush();
             match result {
                 Err(f) => {
-                    show_error!("{}: {}", writer.name, f.to_string());
+                    show_error!("{}: {}", writer.name.maybe_quote(), f);
                     false
                 }
                 _ => true,
@@ -212,7 +217,7 @@ impl Read for NamedReader {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         match self.inner.read(buf) {
             Err(f) => {
-                show_error!("{}: {}", Path::new("stdin").display(), f.to_string());
+                show_error!("stdin: {}", f);
                 Err(f)
             }
             okay => okay,

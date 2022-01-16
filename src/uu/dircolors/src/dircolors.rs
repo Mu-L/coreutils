@@ -8,15 +8,14 @@
 
 // spell-checker:ignore (ToDO) clrtoeol dircolors eightbit endcode fnmatch leftcode multihardlink rightcode setenv sgid suid
 
-#[macro_use]
-extern crate uucore;
-
 use std::borrow::Borrow;
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 use clap::{crate_version, App, Arg};
+use uucore::display::Quotable;
+use uucore::error::{UResult, USimpleError, UUsageError};
 
 mod options {
     pub const BOURNE_SHELL: &str = "bourne-shell";
@@ -62,21 +61,109 @@ pub fn guess_syntax() -> OutputFmt {
     }
 }
 
-fn get_usage() -> String {
-    format!("{0} {1}", executable!(), SYNTAX)
+fn usage() -> String {
+    format!("{0} {1}", uucore::execution_phrase(), SYNTAX)
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let usage = get_usage();
+    let usage = usage();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().usage(&usage[..]).get_matches_from(&args);
+
+    let files = matches
+        .values_of(options::FILE)
+        .map_or(vec![], |file_values| file_values.collect());
+
+    // clap provides .conflicts_with / .conflicts_with_all, but we want to
+    // manually handle conflicts so we can match the output of GNU coreutils
+    if (matches.is_present(options::C_SHELL) || matches.is_present(options::BOURNE_SHELL))
+        && matches.is_present(options::PRINT_DATABASE)
+    {
+        return Err(UUsageError::new(
+            1,
+            "the options to output dircolors' internal database and\nto select a shell \
+             syntax are mutually exclusive",
+        ));
+    }
+
+    if matches.is_present(options::PRINT_DATABASE) {
+        if !files.is_empty() {
+            return Err(UUsageError::new(
+                1,
+                format!(
+                    "extra operand {}\nfile operands cannot be combined with \
+                     --print-database (-p)",
+                    files[0].quote()
+                ),
+            ));
+        }
+        println!("{}", INTERNAL_DB);
+        return Ok(());
+    }
+
+    let mut out_format = OutputFmt::Unknown;
+    if matches.is_present(options::C_SHELL) {
+        out_format = OutputFmt::CShell;
+    } else if matches.is_present(options::BOURNE_SHELL) {
+        out_format = OutputFmt::Shell;
+    }
+
+    if out_format == OutputFmt::Unknown {
+        match guess_syntax() {
+            OutputFmt::Unknown => {
+                return Err(USimpleError::new(
+                    1,
+                    "no SHELL environment variable, and no shell type option given",
+                ));
+            }
+            fmt => out_format = fmt,
+        }
+    }
+
+    let result;
+    if files.is_empty() {
+        result = parse(INTERNAL_DB.lines(), out_format, "")
+    } else {
+        if files.len() > 1 {
+            return Err(UUsageError::new(
+                1,
+                format!("extra operand {}", files[1].quote()),
+            ));
+        }
+        match File::open(files[0]) {
+            Ok(f) => {
+                let fin = BufReader::new(f);
+                result = parse(fin.lines().filter_map(Result::ok), out_format, files[0])
+            }
+            Err(e) => {
+                return Err(USimpleError::new(
+                    1,
+                    format!("{}: {}", files[0].maybe_quote(), e),
+                ));
+            }
+        }
+    }
+
+    match result {
+        Ok(s) => {
+            println!("{}", s);
+            Ok(())
+        }
+        Err(s) => {
+            return Err(USimpleError::new(1, s));
+        }
+    }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(SUMMARY)
-        .usage(&usage[..])
         .after_help(LONG_HELP)
         .arg(
             Arg::with_name(options::BOURNE_SHELL)
@@ -102,83 +189,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .display_order(3),
         )
         .arg(Arg::with_name(options::FILE).hidden(true).multiple(true))
-        .get_matches_from(&args);
-
-    let files = matches
-        .values_of(options::FILE)
-        .map_or(vec![], |file_values| file_values.collect());
-
-    // clap provides .conflicts_with / .conflicts_with_all, but we want to
-    // manually handle conflicts so we can match the output of GNU coreutils
-    if (matches.is_present(options::C_SHELL) || matches.is_present(options::BOURNE_SHELL))
-        && matches.is_present(options::PRINT_DATABASE)
-    {
-        show_usage_error!(
-            "the options to output dircolors' internal database and\nto select a shell \
-             syntax are mutually exclusive"
-        );
-        return 1;
-    }
-
-    if matches.is_present(options::PRINT_DATABASE) {
-        if !files.is_empty() {
-            show_usage_error!(
-                "extra operand ‘{}’\nfile operands cannot be combined with \
-                 --print-database (-p)",
-                files[0]
-            );
-            return 1;
-        }
-        println!("{}", INTERNAL_DB);
-        return 0;
-    }
-
-    let mut out_format = OutputFmt::Unknown;
-    if matches.is_present(options::C_SHELL) {
-        out_format = OutputFmt::CShell;
-    } else if matches.is_present(options::BOURNE_SHELL) {
-        out_format = OutputFmt::Shell;
-    }
-
-    if out_format == OutputFmt::Unknown {
-        match guess_syntax() {
-            OutputFmt::Unknown => {
-                show_error!("no SHELL environment variable, and no shell type option given");
-                return 1;
-            }
-            fmt => out_format = fmt,
-        }
-    }
-
-    let result;
-    if files.is_empty() {
-        result = parse(INTERNAL_DB.lines(), out_format, "")
-    } else {
-        if files.len() > 1 {
-            show_usage_error!("extra operand ‘{}’", files[1]);
-            return 1;
-        }
-        match File::open(files[0]) {
-            Ok(f) => {
-                let fin = BufReader::new(f);
-                result = parse(fin.lines().filter_map(Result::ok), out_format, files[0])
-            }
-            Err(e) => {
-                show_error!("{}: {}", files[0], e);
-                return 1;
-            }
-        }
-    }
-    match result {
-        Ok(s) => {
-            println!("{}", s);
-            0
-        }
-        Err(s) => {
-            show_error!("{}", s);
-            1
-        }
-    }
 }
 
 pub trait StrUtils {
@@ -192,21 +202,25 @@ pub trait StrUtils {
 impl StrUtils for str {
     fn purify(&self) -> &Self {
         let mut line = self;
-        for (n, c) in self.chars().enumerate() {
-            if c != '#' {
-                continue;
-            }
-
-            // Ignore if '#' is at the beginning of line
-            if n == 0 {
-                line = &self[..0];
-                break;
-            }
-
+        for (n, _) in self
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c == b'#')
+        {
             // Ignore the content after '#'
             // only if it is preceded by at least one whitespace
-            if self.chars().nth(n - 1).unwrap().is_whitespace() {
-                line = &self[..n];
+            match self[..n].chars().last() {
+                Some(c) if c.is_whitespace() => {
+                    line = &self[..n - c.len_utf8()];
+                    break;
+                }
+                None => {
+                    // n == 0
+                    line = &self[..0];
+                    break;
+                }
+                _ => (),
             }
         }
         line.trim()
@@ -308,7 +322,8 @@ where
         if val.is_empty() {
             return Err(format!(
                 "{}:{}: invalid line;  missing second token",
-                fp, num
+                fp.maybe_quote(),
+                num
             ));
         }
         let lower = key.to_lowercase();
@@ -335,7 +350,12 @@ where
                 } else if let Some(s) = table.get(lower.as_str()) {
                     result.push_str(format!("{}={}:", s, val).as_str());
                 } else {
-                    return Err(format!("{}:{}: unrecognized keyword {}", fp, num, key));
+                    return Err(format!(
+                        "{}:{}: unrecognized keyword {}",
+                        fp.maybe_quote(),
+                        num,
+                        key
+                    ));
                 }
             }
         }

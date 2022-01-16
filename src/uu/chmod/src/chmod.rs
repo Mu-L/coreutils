@@ -7,18 +7,17 @@
 
 // spell-checker:ignore (ToDO) Chmoder cmode fmode fperm fref ugoa RFILE RFILE's
 
-#[macro_use]
-extern crate uucore;
-
 use clap::{crate_version, App, Arg};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use uucore::display::Quotable;
+use uucore::error::{ExitCode, UResult, USimpleError, UUsageError};
 use uucore::fs::display_permissions_unix;
 use uucore::libc::mode_t;
 #[cfg(not(windows))]
 use uucore::mode;
-use uucore::InvalidEncodingHandling;
+use uucore::{show_error, InvalidEncodingHandling};
 use walkdir::WalkDir;
 
 static ABOUT: &str = "Change the mode of each FILE to MODE.
@@ -36,12 +35,12 @@ mod options {
     pub const FILE: &str = "FILE";
 }
 
-fn get_usage() -> String {
+fn usage() -> String {
     format!(
         "{0} [OPTION]... MODE[,MODE]... FILE...
 or: {0} [OPTION]... OCTAL-MODE FILE...
 or: {0} [OPTION]... --reference=RFILE FILE...",
-        executable!()
+        uucore::execution_phrase()
     )
 }
 
@@ -49,23 +48,83 @@ fn get_long_usage() -> String {
     String::from("Each MODE is of the form '[ugoa]*([-+=]([rwxXst]*|[ugo]))+|[-+=]?[0-7]+'.")
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let mut args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
     // Before we can parse 'args' with clap (and previously getopts),
     // a possible MODE prefix '-' needs to be removed (e.g. "chmod -x FILE").
-    let mode_had_minus_prefix = strip_minus_from_mode(&mut args);
+    let mode_had_minus_prefix = mode::strip_minus_from_mode(&mut args);
 
-    let usage = get_usage();
+    let usage = usage();
     let after_help = get_long_usage();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
+    let matches = uu_app()
         .usage(&usage[..])
         .after_help(&after_help[..])
+        .get_matches_from(args);
+
+    let changes = matches.is_present(options::CHANGES);
+    let quiet = matches.is_present(options::QUIET);
+    let verbose = matches.is_present(options::VERBOSE);
+    let preserve_root = matches.is_present(options::PRESERVE_ROOT);
+    let recursive = matches.is_present(options::RECURSIVE);
+    let fmode = match matches.value_of(options::REFERENCE) {
+        Some(fref) => match fs::metadata(fref) {
+            Ok(meta) => Some(meta.mode()),
+            Err(err) => {
+                return Err(USimpleError::new(
+                    1,
+                    format!("cannot stat attributes of {}: {}", fref.quote(), err),
+                ))
+            }
+        },
+        None => None,
+    };
+    let modes = matches.value_of(options::MODE).unwrap(); // should always be Some because required
+    let cmode = if mode_had_minus_prefix {
+        // clap parsing is finished, now put prefix back
+        format!("-{}", modes)
+    } else {
+        modes.to_string()
+    };
+    let mut files: Vec<String> = matches
+        .values_of(options::FILE)
+        .map(|v| v.map(ToString::to_string).collect())
+        .unwrap_or_default();
+    let cmode = if fmode.is_some() {
+        // "--reference" and MODE are mutually exclusive
+        // if "--reference" was used MODE needs to be interpreted as another FILE
+        // it wasn't possible to implement this behavior directly with clap
+        files.push(cmode);
+        None
+    } else {
+        Some(cmode)
+    };
+
+    if files.is_empty() {
+        return Err(UUsageError::new(1, "missing operand".to_string()));
+    }
+
+    let chmoder = Chmoder {
+        changes,
+        quiet,
+        verbose,
+        preserve_root,
+        recursive,
+        fmode,
+        cmode,
+    };
+
+    chmoder.chmod(files)
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
         .arg(
             Arg::with_name(options::CHANGES)
                 .long(options::CHANGES)
@@ -120,76 +179,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .required_unless(options::MODE)
                 .multiple(true),
         )
-        .get_matches_from(args);
-
-    let changes = matches.is_present(options::CHANGES);
-    let quiet = matches.is_present(options::QUIET);
-    let verbose = matches.is_present(options::VERBOSE);
-    let preserve_root = matches.is_present(options::PRESERVE_ROOT);
-    let recursive = matches.is_present(options::RECURSIVE);
-    let fmode = matches
-        .value_of(options::REFERENCE)
-        .and_then(|fref| match fs::metadata(fref) {
-            Ok(meta) => Some(meta.mode()),
-            Err(err) => crash!(1, "cannot stat attributes of '{}': {}", fref, err),
-        });
-    let modes = matches.value_of(options::MODE).unwrap(); // should always be Some because required
-    let cmode = if mode_had_minus_prefix {
-        // clap parsing is finished, now put prefix back
-        format!("-{}", modes)
-    } else {
-        modes.to_string()
-    };
-    let mut files: Vec<String> = matches
-        .values_of(options::FILE)
-        .map(|v| v.map(ToString::to_string).collect())
-        .unwrap_or_default();
-    let cmode = if fmode.is_some() {
-        // "--reference" and MODE are mutually exclusive
-        // if "--reference" was used MODE needs to be interpreted as another FILE
-        // it wasn't possible to implement this behavior directly with clap
-        files.push(cmode);
-        None
-    } else {
-        Some(cmode)
-    };
-
-    let chmoder = Chmoder {
-        changes,
-        quiet,
-        verbose,
-        preserve_root,
-        recursive,
-        fmode,
-        cmode,
-    };
-    match chmoder.chmod(files) {
-        Ok(()) => {}
-        Err(e) => return e,
-    }
-
-    0
-}
-
-// Iterate 'args' and delete the first occurrence
-// of a prefix '-' if it's associated with MODE
-// e.g. "chmod -v -xw -R FILE" -> "chmod -v xw -R FILE"
-pub fn strip_minus_from_mode(args: &mut Vec<String>) -> bool {
-    for arg in args {
-        if arg.starts_with('-') {
-            if let Some(second) = arg.chars().nth(1) {
-                match second {
-                    'r' | 'w' | 'x' | 'X' | 's' | 't' | 'u' | 'g' | 'o' | '0'..='7' => {
-                        // TODO: use strip_prefix() once minimum rust version reaches 1.45.0
-                        *arg = arg[1..arg.len()].to_string();
-                        return true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    false
 }
 
 struct Chmoder {
@@ -203,7 +192,7 @@ struct Chmoder {
 }
 
 impl Chmoder {
-    fn chmod(&self, files: Vec<String>) -> Result<(), i32> {
+    fn chmod(&self, files: Vec<String>) -> UResult<()> {
         let mut r = Ok(());
 
         for filename in &files {
@@ -212,23 +201,34 @@ impl Chmoder {
             if !file.exists() {
                 if is_symlink(file) {
                     println!(
-                        "failed to change mode of '{}' from 0000 (---------) to 0000 (---------)",
-                        filename
+                        "failed to change mode of {} from 0000 (---------) to 0000 (---------)",
+                        filename.quote()
                     );
                     if !self.quiet {
-                        show_error!("cannot operate on dangling symlink '{}'", filename);
+                        return Err(USimpleError::new(
+                            1,
+                            format!("cannot operate on dangling symlink {}", filename.quote()),
+                        ));
                     }
-                } else {
-                    show_error!("cannot access '{}': No such file or directory", filename);
+                } else if !self.quiet {
+                    return Err(USimpleError::new(
+                        1,
+                        format!(
+                            "cannot access {}: No such file or directory",
+                            filename.quote()
+                        ),
+                    ));
                 }
-                return Err(1);
+                return Err(ExitCode::new(1));
             }
             if self.recursive && self.preserve_root && filename == "/" {
-                show_error!(
-                    "it is dangerous to operate recursively on '{}'\nuse --no-preserve-root to override this failsafe",
-                    filename
-                );
-                return Err(1);
+                return Err(USimpleError::new(
+                    1,
+                    format!(
+                        "it is dangerous to operate recursively on {}\nuse --no-preserve-root to override this failsafe",
+                        filename.quote()
+                    )
+                ));
             }
             if !self.recursive {
                 r = self.chmod_file(file).and(r);
@@ -243,57 +243,89 @@ impl Chmoder {
     }
 
     #[cfg(windows)]
-    fn chmod_file(&self, file: &Path) -> Result<(), i32> {
+    fn chmod_file(&self, file: &Path) -> UResult<()> {
         // chmod is useless on Windows
         // it doesn't set any permissions at all
         // instead it just sets the readonly attribute on the file
-        Err(0)
+        Ok(())
     }
-    #[cfg(any(unix, target_os = "redox"))]
-    fn chmod_file(&self, file: &Path) -> Result<(), i32> {
-        let mut fperm = match fs::metadata(file) {
+    #[cfg(unix)]
+    fn chmod_file(&self, file: &Path) -> UResult<()> {
+        use uucore::mode::get_umask;
+
+        let fperm = match fs::metadata(file) {
             Ok(meta) => meta.mode() & 0o7777,
             Err(err) => {
                 if is_symlink(file) {
                     if self.verbose {
                         println!(
-                            "neither symbolic link '{}' nor referent has been changed",
-                            file.display()
+                            "neither symbolic link {} nor referent has been changed",
+                            file.quote()
                         );
                     }
                     return Ok(());
                 } else if err.kind() == std::io::ErrorKind::PermissionDenied {
-                    show_error!("'{}': Permission denied", file.display());
+                    // These two filenames would normally be conditionally
+                    // quoted, but GNU's tests expect them to always be quoted
+                    return Err(USimpleError::new(
+                        1,
+                        format!("{}: Permission denied", file.quote()),
+                    ));
                 } else {
-                    show_error!("'{}': {}", file.display(), err);
+                    return Err(USimpleError::new(1, format!("{}: {}", file.quote(), err)));
                 }
-                return Err(1);
             }
         };
         match self.fmode {
             Some(mode) => self.change_file(fperm, mode, file)?,
             None => {
                 let cmode_unwrapped = self.cmode.clone().unwrap();
+                let mut new_mode = fperm;
+                let mut naively_expected_new_mode = new_mode;
                 for mode in cmode_unwrapped.split(',') {
                     // cmode is guaranteed to be Some in this case
                     let arr: &[char] = &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
                     let result = if mode.contains(arr) {
-                        mode::parse_numeric(fperm, mode)
+                        mode::parse_numeric(new_mode, mode, file.is_dir()).map(|v| (v, v))
                     } else {
-                        mode::parse_symbolic(fperm, mode, file.is_dir())
+                        mode::parse_symbolic(new_mode, mode, get_umask(), file.is_dir()).map(|m| {
+                            // calculate the new mode as if umask was 0
+                            let naive_mode = mode::parse_symbolic(
+                                naively_expected_new_mode,
+                                mode,
+                                0,
+                                file.is_dir(),
+                            )
+                            .unwrap(); // we know that mode must be valid, so this cannot fail
+                            (m, naive_mode)
+                        })
                     };
                     match result {
-                        Ok(mode) => {
-                            self.change_file(fperm, mode, file)?;
-                            fperm = mode;
+                        Ok((mode, naive_mode)) => {
+                            new_mode = mode;
+                            naively_expected_new_mode = naive_mode;
                         }
                         Err(f) => {
                             if !self.quiet {
-                                show_error!("{}", f);
+                                return Err(USimpleError::new(1, f));
+                            } else {
+                                return Err(ExitCode::new(1));
                             }
-                            return Err(1);
                         }
                     }
+                }
+                self.change_file(fperm, new_mode, file)?;
+                // if a permission would have been removed if umask was 0, but it wasn't because umask was not 0, print an error and fail
+                if (new_mode & !naively_expected_new_mode) != 0 {
+                    return Err(USimpleError::new(
+                        1,
+                        format!(
+                            "{}: new permissions are {}, not {}",
+                            file.maybe_quote(),
+                            display_permissions_unix(new_mode as mode_t, false),
+                            display_permissions_unix(naively_expected_new_mode as mode_t, false)
+                        ),
+                    ));
                 }
             }
         }
@@ -306,8 +338,8 @@ impl Chmoder {
         if fperm == mode {
             if self.verbose && !self.changes {
                 println!(
-                    "mode of '{}' retained as {:04o} ({})",
-                    file.display(),
+                    "mode of {} retained as {:04o} ({})",
+                    file.quote(),
                     fperm,
                     display_permissions_unix(fperm as mode_t, false),
                 );
@@ -318,9 +350,9 @@ impl Chmoder {
                 show_error!("{}", err);
             }
             if self.verbose {
-                show_error!(
-                    "failed to change mode of file '{}' from {:o} ({}) to {:o} ({})",
-                    file.display(),
+                println!(
+                    "failed to change mode of file {} from {:04o} ({}) to {:04o} ({})",
+                    file.quote(),
                     fperm,
                     display_permissions_unix(fperm as mode_t, false),
                     mode,
@@ -330,9 +362,9 @@ impl Chmoder {
             Err(1)
         } else {
             if self.verbose || self.changes {
-                show_error!(
-                    "mode of '{}' changed from {:o} ({}) to {:o} ({})",
-                    file.display(),
+                println!(
+                    "mode of {} changed from {:04o} ({}) to {:04o} ({})",
+                    file.quote(),
                     fperm,
                     display_permissions_unix(fperm as mode_t, false),
                     mode,

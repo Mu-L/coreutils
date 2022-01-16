@@ -7,21 +7,20 @@
 
 // spell-checker:ignore (ToDO) fullname
 
-#[macro_use]
-extern crate uucore;
-
 use clap::{crate_version, App, Arg};
 use std::path::{is_separator, PathBuf};
+use uucore::display::Quotable;
+use uucore::error::{UResult, UUsageError};
 use uucore::InvalidEncodingHandling;
 
 static SUMMARY: &str = "Print NAME with any leading directory components removed
 If specified, also remove a trailing SUFFIX";
 
-fn get_usage() -> String {
+fn usage() -> String {
     format!(
         "{0} NAME [SUFFIX]
     {0} OPTION... NAME...",
-        executable!()
+        uucore::execution_phrase()
     )
 }
 
@@ -32,48 +31,20 @@ pub mod options {
     pub static ZERO: &str = "zero";
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
-    let usage = get_usage();
+    let usage = usage();
     //
     // Argument parsing
     //
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(SUMMARY)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::MULTIPLE)
-                .short("a")
-                .long(options::MULTIPLE)
-                .help("support multiple arguments and treat each as a NAME"),
-        )
-        .arg(Arg::with_name(options::NAME).multiple(true).hidden(true))
-        .arg(
-            Arg::with_name(options::SUFFIX)
-                .short("s")
-                .long(options::SUFFIX)
-                .value_name("SUFFIX")
-                .help("remove a trailing SUFFIX; implies -a"),
-        )
-        .arg(
-            Arg::with_name(options::ZERO)
-                .short("z")
-                .long(options::ZERO)
-                .help("end each output line with NUL, not newline"),
-        )
-        .get_matches_from(args);
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
 
     // too few arguments
     if !matches.is_present(options::NAME) {
-        crash!(
-            1,
-            "{1}\nTry '{0} --help' for more information.",
-            executable!(),
-            "missing operand"
-        );
+        return Err(UUsageError::new(1, "missing operand".to_string()));
     }
 
     let opt_suffix = matches.is_present(options::SUFFIX);
@@ -82,12 +53,18 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     let multiple_paths = opt_suffix || opt_multiple;
     // too many arguments
     if !multiple_paths && matches.occurrences_of(options::NAME) > 2 {
-        crash!(
+        return Err(UUsageError::new(
             1,
-            "extra operand '{1}'\nTry '{0} --help' for more information.",
-            executable!(),
-            matches.values_of(options::NAME).unwrap().nth(2).unwrap()
-        );
+            format!(
+                "extra operand {}",
+                matches
+                    .values_of(options::NAME)
+                    .unwrap()
+                    .nth(2)
+                    .unwrap()
+                    .quote()
+            ),
+        ));
     }
 
     let suffix = if opt_suffix {
@@ -113,31 +90,57 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         print!("{}{}", basename(path, suffix), line_ending);
     }
 
-    0
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(SUMMARY)
+        .arg(
+            Arg::with_name(options::MULTIPLE)
+                .short("a")
+                .long(options::MULTIPLE)
+                .help("support multiple arguments and treat each as a NAME"),
+        )
+        .arg(Arg::with_name(options::NAME).multiple(true).hidden(true))
+        .arg(
+            Arg::with_name(options::SUFFIX)
+                .short("s")
+                .long(options::SUFFIX)
+                .value_name("SUFFIX")
+                .help("remove a trailing SUFFIX; implies -a"),
+        )
+        .arg(
+            Arg::with_name(options::ZERO)
+                .short("z")
+                .long(options::ZERO)
+                .help("end each output line with NUL, not newline"),
+        )
 }
 
 fn basename(fullname: &str, suffix: &str) -> String {
-    // Remove all platform-specific path separators from the end
+    // Remove all platform-specific path separators from the end.
     let path = fullname.trim_end_matches(is_separator);
+
+    // If the path contained *only* suffix characters (for example, if
+    // `fullname` were "///" and `suffix` were "/"), then `path` would
+    // be left with the empty string. In that case, we set `path` to be
+    // the original `fullname` to avoid returning the empty path.
+    let path = if path.is_empty() { fullname } else { path };
 
     // Convert to path buffer and get last path component
     let pb = PathBuf::from(path);
     match pb.components().last() {
-        Some(c) => strip_suffix(c.as_os_str().to_str().unwrap(), suffix),
+        Some(c) => {
+            let name = c.as_os_str().to_str().unwrap();
+            if name == suffix {
+                name.to_string()
+            } else {
+                name.strip_suffix(suffix).unwrap_or(name).to_string()
+            }
+        }
+
         None => "".to_owned(),
     }
-}
-
-// can be replaced with strip_suffix once MSRV is 1.45
-#[allow(clippy::manual_strip)]
-fn strip_suffix(name: &str, suffix: &str) -> String {
-    if name == suffix {
-        return name.to_owned();
-    }
-
-    if name.ends_with(suffix) {
-        return name[..name.len() - suffix.len()].to_owned();
-    }
-
-    name.to_owned()
 }

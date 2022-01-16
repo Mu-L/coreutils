@@ -10,24 +10,113 @@
 
 mod parser;
 
-use parser::{parse, Symbol};
+use clap::{crate_version, App, AppSettings};
+use parser::{parse, Operator, Symbol, UnaryOperator};
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use uucore::display::Quotable;
+use uucore::error::{UResult, USimpleError};
 
-pub fn uumain(mut args: impl uucore::Args) -> i32 {
+const USAGE: &str = "test EXPRESSION
+or:  test
+or:  [ EXPRESSION ]
+or:  [ ]
+or:  [ OPTION";
+
+// We use after_help so that this comes after the usage string (it would come before if we used about)
+const AFTER_HELP: &str = "
+Exit with the status determined by EXPRESSION.
+
+An omitted EXPRESSION defaults to false.  Otherwise,
+EXPRESSION is true or false and sets exit status.  It is one of:
+
+  ( EXPRESSION )               EXPRESSION is true
+  ! EXPRESSION                 EXPRESSION is false
+  EXPRESSION1 -a EXPRESSION2   both EXPRESSION1 and EXPRESSION2 are true
+  EXPRESSION1 -o EXPRESSION2   either EXPRESSION1 or EXPRESSION2 is true
+
+  -n STRING            the length of STRING is nonzero
+  STRING               equivalent to -n STRING
+  -z STRING            the length of STRING is zero
+  STRING1 = STRING2    the strings are equal
+  STRING1 != STRING2   the strings are not equal
+
+  INTEGER1 -eq INTEGER2   INTEGER1 is equal to INTEGER2
+  INTEGER1 -ge INTEGER2   INTEGER1 is greater than or equal to INTEGER2
+  INTEGER1 -gt INTEGER2   INTEGER1 is greater than INTEGER2
+  INTEGER1 -le INTEGER2   INTEGER1 is less than or equal to INTEGER2
+  INTEGER1 -lt INTEGER2   INTEGER1 is less than INTEGER2
+  INTEGER1 -ne INTEGER2   INTEGER1 is not equal to INTEGER2
+
+  FILE1 -ef FILE2   FILE1 and FILE2 have the same device and inode numbers
+  FILE1 -nt FILE2   FILE1 is newer (modification date) than FILE2
+  FILE1 -ot FILE2   FILE1 is older than FILE2
+
+  -b FILE     FILE exists and is block special
+  -c FILE     FILE exists and is character special
+  -d FILE     FILE exists and is a directory
+  -e FILE     FILE exists
+  -f FILE     FILE exists and is a regular file
+  -g FILE     FILE exists and is set-group-ID
+  -G FILE     FILE exists and is owned by the effective group ID
+  -h FILE     FILE exists and is a symbolic link (same as -L)
+  -k FILE     FILE exists and has its sticky bit set
+  -L FILE     FILE exists and is a symbolic link (same as -h)
+  -N FILE     FILE exists and has been modified since it was last read
+  -O FILE     FILE exists and is owned by the effective user ID
+  -p FILE     FILE exists and is a named pipe
+  -r FILE     FILE exists and read permission is granted
+  -s FILE     FILE exists and has a size greater than zero
+  -S FILE     FILE exists and is a socket
+  -t FD       file descriptor FD is opened on a terminal
+  -u FILE     FILE exists and its set-user-ID bit is set
+  -w FILE     FILE exists and write permission is granted
+  -x FILE     FILE exists and execute (or search) permission is granted
+
+Except for -h and -L, all FILE-related tests dereference symbolic links.
+Beware that parentheses need to be escaped (e.g., by backslashes) for shells.
+INTEGER may also be -l STRING, which evaluates to the length of STRING.
+
+NOTE: Binary -a and -o are inherently ambiguous.  Use 'test EXPR1 && test
+EXPR2' or 'test EXPR1 || test EXPR2' instead.
+
+NOTE: [ honors the --help and --version options, but test does not.
+test treats each of those as it treats any other nonempty STRING.
+
+NOTE: your shell may have its own version of test and/or [, which usually supersedes
+the version described here.  Please refer to your shell's documentation
+for details about the options it supports.";
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .setting(AppSettings::DisableHelpFlags)
+        .setting(AppSettings::DisableVersion)
+}
+
+#[uucore_procs::gen_uumain]
+pub fn uumain(mut args: impl uucore::Args) -> UResult<()> {
     let program = args.next().unwrap_or_else(|| OsString::from("test"));
-    let binary_name = Path::new(&program)
-        .file_name()
-        .unwrap_or_else(|| OsStr::new("test"))
-        .to_string_lossy();
+    let binary_name = uucore::util_name();
     let mut args: Vec<_> = args.collect();
 
-    // If invoked via name '[', matching ']' must be in the last arg
-    if binary_name == "[" {
+    if binary_name.ends_with('[') {
+        // If invoked as [ we should recognize --help and --version (but not -h or -v)
+        if args.len() == 1 && (args[0] == "--help" || args[0] == "--version") {
+            // Let clap pretty-print help and version
+            App::new(binary_name)
+                .version(crate_version!())
+                .usage(USAGE)
+                .after_help(AFTER_HELP)
+                // Disable printing of -h and -v as valid alternatives for --help and --version,
+                // since we don't recognize -h and -v as help/version flags.
+                .setting(AppSettings::NeedsLongHelp)
+                .setting(AppSettings::NeedsLongVersion)
+                .get_matches_from(std::iter::once(program).chain(args.into_iter()));
+            return Ok(());
+        }
+        // If invoked via name '[', matching ']' must be in the last arg
         let last = args.pop();
-        if last != Some(OsString::from("]")) {
-            eprintln!("[: missing ']'");
-            return 2;
+        if last.as_deref() != Some(OsStr::new("]")) {
+            return Err(USimpleError::new(2, "missing ']'"));
         }
     }
 
@@ -36,15 +125,12 @@ pub fn uumain(mut args: impl uucore::Args) -> i32 {
     match result {
         Ok(result) => {
             if result {
-                0
+                Ok(())
             } else {
-                1
+                Err(1.into())
             }
         }
-        Err(e) => {
-            eprintln!("test: {}", e);
-            2
-        }
+        Err(e) => Err(USimpleError::new(2, e)),
     }
 }
 
@@ -68,19 +154,19 @@ fn eval(stack: &mut Vec<Symbol>) -> Result<bool, String> {
 
             Ok(!result)
         }
-        Some(Symbol::StringOp(op)) => {
+        Some(Symbol::Op(Operator::String(op))) => {
             let b = stack.pop();
             let a = stack.pop();
             Ok(if op == "!=" { a != b } else { a == b })
         }
-        Some(Symbol::IntOp(op)) => {
+        Some(Symbol::Op(Operator::Int(op))) => {
             let b = pop_literal!();
             let a = pop_literal!();
 
             Ok(integers(&a, &b, &op)?)
         }
-        Some(Symbol::FileOp(_op)) => unimplemented!(),
-        Some(Symbol::StrlenOp(op)) => {
+        Some(Symbol::Op(Operator::File(_op))) => unimplemented!(),
+        Some(Symbol::UnaryOp(UnaryOperator::StrlenOp(op))) => {
             let s = match stack.pop() {
                 Some(Symbol::Literal(s)) => s,
                 Some(Symbol::None) => OsString::from(""),
@@ -88,7 +174,7 @@ fn eval(stack: &mut Vec<Symbol>) -> Result<bool, String> {
                     return Ok(true);
                 }
                 _ => {
-                    return Err(format!("missing argument after ‘{:?}’", op));
+                    return Err(format!("missing argument after '{:?}'", op));
                 }
             };
 
@@ -98,12 +184,12 @@ fn eval(stack: &mut Vec<Symbol>) -> Result<bool, String> {
                 !s.is_empty()
             })
         }
-        Some(Symbol::FiletestOp(op)) => {
-            let op = op.to_string_lossy();
+        Some(Symbol::UnaryOp(UnaryOperator::FiletestOp(op))) => {
+            let op = op.to_str().unwrap();
 
             let f = pop_literal!();
 
-            Ok(match op.as_ref() {
+            Ok(match op {
                 "-b" => path(&f, PathCondition::BlockSpecial),
                 "-c" => path(&f, PathCondition::CharacterSpecial),
                 "-d" => path(&f, PathCondition::Directory),
@@ -140,31 +226,33 @@ fn eval(stack: &mut Vec<Symbol>) -> Result<bool, String> {
 }
 
 fn integers(a: &OsStr, b: &OsStr, op: &OsStr) -> Result<bool, String> {
-    let format_err = |value| format!("invalid integer ‘{}’", value);
+    let format_err = |value: &OsStr| format!("invalid integer {}", value.quote());
 
-    let a = a.to_string_lossy();
-    let a: i64 = a.parse().map_err(|_| format_err(a))?;
+    let a: i64 = a
+        .to_str()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format_err(a))?;
 
-    let b = b.to_string_lossy();
-    let b: i64 = b.parse().map_err(|_| format_err(b))?;
+    let b: i64 = b
+        .to_str()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format_err(b))?;
 
-    let operator = op.to_string_lossy();
-    Ok(match operator.as_ref() {
-        "-eq" => a == b,
-        "-ne" => a != b,
-        "-gt" => a > b,
-        "-ge" => a >= b,
-        "-lt" => a < b,
-        "-le" => a <= b,
-        _ => return Err(format!("unknown operator ‘{}’", operator)),
+    Ok(match op.to_str() {
+        Some("-eq") => a == b,
+        Some("-ne") => a != b,
+        Some("-gt") => a > b,
+        Some("-ge") => a >= b,
+        Some("-lt") => a < b,
+        Some("-le") => a <= b,
+        _ => return Err(format!("unknown operator {}", op.quote())),
     })
 }
 
 fn isatty(fd: &OsStr) -> Result<bool, String> {
-    let fd = fd.to_string_lossy();
-
-    fd.parse()
-        .map_err(|_| format!("invalid integer ‘{}’", fd))
+    fd.to_str()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("invalid integer {}", fd.quote()))
         .map(|i| {
             #[cfg(not(target_os = "redox"))]
             unsafe {

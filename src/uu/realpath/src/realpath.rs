@@ -11,28 +11,73 @@
 extern crate uucore;
 
 use clap::{crate_version, App, Arg};
-use std::path::{Path, PathBuf};
-use uucore::fs::{canonicalize, CanonicalizeMode};
+use std::{
+    io::{stdout, Write},
+    path::{Path, PathBuf},
+};
+use uucore::{
+    display::{print_verbatim, Quotable},
+    error::{FromIo, UResult},
+    fs::{canonicalize, MissingHandling, ResolveMode},
+};
 
 static ABOUT: &str = "print the resolved path";
 
 static OPT_QUIET: &str = "quiet";
 static OPT_STRIP: &str = "strip";
 static OPT_ZERO: &str = "zero";
+static OPT_PHYSICAL: &str = "physical";
+static OPT_LOGICAL: &str = "logical";
+const OPT_CANONICALIZE_MISSING: &str = "canonicalize-missing";
+const OPT_CANONICALIZE_EXISTING: &str = "canonicalize-existing";
 
 static ARG_FILES: &str = "files";
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... FILE...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... FILE...", uucore::execution_phrase())
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let usage = usage();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+
+    /*  the list of files */
+
+    let paths: Vec<PathBuf> = matches
+        .values_of(ARG_FILES)
+        .unwrap()
+        .map(PathBuf::from)
+        .collect();
+
+    let strip = matches.is_present(OPT_STRIP);
+    let zero = matches.is_present(OPT_ZERO);
+    let quiet = matches.is_present(OPT_QUIET);
+    let logical = matches.is_present(OPT_LOGICAL);
+    let can_mode = if matches.is_present(OPT_CANONICALIZE_EXISTING) {
+        MissingHandling::Existing
+    } else if matches.is_present(OPT_CANONICALIZE_MISSING) {
+        MissingHandling::Missing
+    } else {
+        MissingHandling::Normal
+    };
+    for path in &paths {
+        let result = resolve_path(path, strip, zero, logical, can_mode);
+        if !quiet {
+            show_if_err!(result.map_err_context(|| path.maybe_quote().to_string()));
+        }
+    }
+    // Although we return `Ok`, it is possible that a call to
+    // `show!()` above has set the exit code for the program to a
+    // non-zero integer.
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
         .arg(
             Arg::with_name(OPT_QUIET)
                 .short("q")
@@ -52,35 +97,43 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .help("Separate output filenames with \\0 rather than newline"),
         )
         .arg(
+            Arg::with_name(OPT_LOGICAL)
+                .short("L")
+                .long(OPT_LOGICAL)
+                .help("resolve '..' components before symlinks"),
+        )
+        .arg(
+            Arg::with_name(OPT_PHYSICAL)
+                .short("P")
+                .long(OPT_PHYSICAL)
+                .overrides_with_all(&[OPT_STRIP, OPT_LOGICAL])
+                .help("resolve symlinks as encountered (default)"),
+        )
+        .arg(
+            Arg::with_name(OPT_CANONICALIZE_EXISTING)
+                .short("e")
+                .long(OPT_CANONICALIZE_EXISTING)
+                .help(
+                    "canonicalize by following every symlink in every component of the \
+                     given name recursively, all components must exist",
+                ),
+        )
+        .arg(
+            Arg::with_name(OPT_CANONICALIZE_MISSING)
+                .short("m")
+                .long(OPT_CANONICALIZE_MISSING)
+                .help(
+                    "canonicalize by following every symlink in every component of the \
+                     given name recursively, without requirements on components existence",
+                ),
+        )
+        .arg(
             Arg::with_name(ARG_FILES)
                 .multiple(true)
                 .takes_value(true)
                 .required(true)
                 .min_values(1),
         )
-        .get_matches_from(args);
-
-    /*  the list of files */
-
-    let paths: Vec<PathBuf> = matches
-        .values_of(ARG_FILES)
-        .unwrap()
-        .map(PathBuf::from)
-        .collect();
-
-    let strip = matches.is_present(OPT_STRIP);
-    let zero = matches.is_present(OPT_ZERO);
-    let quiet = matches.is_present(OPT_QUIET);
-    let mut retcode = 0;
-    for path in &paths {
-        if let Err(e) = resolve_path(path, strip, zero) {
-            if !quiet {
-                show_error!("{}: {}", e, path.display());
-            }
-            retcode = 1
-        };
-    }
-    retcode
 }
 
 /// Resolve a path to an absolute form and print it.
@@ -94,14 +147,24 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
 ///
 /// This function returns an error if there is a problem resolving
 /// symbolic links.
-fn resolve_path(p: &Path, strip: bool, zero: bool) -> std::io::Result<()> {
-    let mode = if strip {
-        CanonicalizeMode::None
+fn resolve_path(
+    p: &Path,
+    strip: bool,
+    zero: bool,
+    logical: bool,
+    can_mode: MissingHandling,
+) -> std::io::Result<()> {
+    let resolve = if strip {
+        ResolveMode::None
+    } else if logical {
+        ResolveMode::Logical
     } else {
-        CanonicalizeMode::Normal
+        ResolveMode::Physical
     };
-    let abs = canonicalize(p, mode)?;
-    let line_ending = if zero { '\0' } else { '\n' };
-    print!("{}{}", abs.display(), line_ending);
+    let abs = canonicalize(p, can_mode, resolve)?;
+    let line_ending = if zero { b'\0' } else { b'\n' };
+
+    print_verbatim(&abs)?;
+    stdout().write_all(&[line_ending])?;
     Ok(())
 }

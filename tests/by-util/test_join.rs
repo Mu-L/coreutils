@@ -94,6 +94,18 @@ fn unpaired_lines() {
         .arg("2")
         .succeeds()
         .stdout_only_fixture("unpaired_lines.expected");
+
+    new_ucmd!()
+        .arg("fields_3.txt")
+        .arg("fields_2.txt")
+        .arg("-1")
+        .arg("2")
+        .arg("-a")
+        .arg("1")
+        .arg("-a")
+        .arg("2")
+        .succeeds()
+        .stdout_only_fixture("unpaired_lines_outer.expected");
 }
 
 #[test]
@@ -107,6 +119,18 @@ fn suppress_joined() {
         .arg("2")
         .succeeds()
         .stdout_only_fixture("suppress_joined.expected");
+
+    new_ucmd!()
+        .arg("fields_3.txt")
+        .arg("fields_2.txt")
+        .arg("-1")
+        .arg("2")
+        .arg("-a")
+        .arg("1")
+        .arg("-v")
+        .arg("2")
+        .succeeds()
+        .stdout_only_fixture("suppress_joined_outer.expected");
 }
 
 #[test]
@@ -203,6 +227,19 @@ fn autoformat() {
         .pipe_in("1 x y z\n2 p")
         .succeeds()
         .stdout_only("1 x y z a\n2 p   b\n");
+
+    new_ucmd!()
+        .arg("-")
+        .arg("fields_2.txt")
+        .arg("-a")
+        .arg("1")
+        .arg("-o")
+        .arg("auto")
+        .arg("-e")
+        .arg(".")
+        .pipe_in("1 x y z\n2 p\n99 a b\n")
+        .succeeds()
+        .stdout_only("1 x y z a\n2 p . . b\n99 a b . .\n");
 }
 
 #[test]
@@ -290,4 +327,22 @@ fn single_file_with_header() {
         .arg("--header")
         .succeeds()
         .stdout_is("A 1\n");
+}
+
+#[test]
+fn non_line_feeds() {
+    new_ucmd!()
+        .arg("non-line_feeds_1.txt")
+        .arg("non-line_feeds_2.txt")
+        .succeeds()
+        .stdout_only_fixture("non-line_feeds.expected");
+}
+
+#[test]
+fn non_unicode() {
+    new_ucmd!()
+        .arg("non-unicode_1.bin")
+        .arg("non-unicode_2.bin")
+        .succeeds()
+        .stdout_only_fixture("non-unicode.expected");
 }

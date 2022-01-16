@@ -1,6 +1,6 @@
 [package]
 name = "uu_rm"
-version = "0.0.6"
+version = "0.0.9"
 authors = ["uutils developers"]
 license = "MIT"
 description = "rm ~ (uutils) remove PATHNAME"
@@ -15,15 +15,18 @@ edition = "2018"
 path = "src/rm.rs"
 
 [dependencies]
-clap = "2.33"
+clap = { version = "2.33", features = ["wrap_help"] }
 walkdir = "2.2"
 remove_dir_all = "0.5.1"
+uucore = { version=">=0.0.11", package="uucore", path="../../uucore", features=["fs"] }
+uucore_procs = { version=">=0.0.8", package="uucore_procs", path="../../uucore_procs" }
+
+[target.'cfg(windows)'.dependencies]
 winapi = { version="0.3", features=[] }
-
-uucore = { version=">=0.0.8", package="uucore", path="../../uucore", features=["fs"] }
-uucore_procs = { version=">=0.0.5", package="uucore_procs", path="../../uucore_procs" }
-
 
 [[bin]]
 name = "rm"
 path = "src/main.rs"
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["uucore_procs"]

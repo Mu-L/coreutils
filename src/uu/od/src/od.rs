@@ -43,6 +43,8 @@ use crate::partialreader::*;
 use crate::peekreader::*;
 use crate::prn_char::format_ascii_dump;
 use clap::{self, crate_version, AppSettings, Arg, ArgMatches};
+use uucore::display::Quotable;
+use uucore::error::{UResult, USimpleError};
 use uucore::parse_size::ParseSizeError;
 use uucore::InvalidEncodingHandling;
 
@@ -119,25 +121,36 @@ struct OdOptions {
 }
 
 impl OdOptions {
-    fn new(matches: ArgMatches, args: Vec<String>) -> Result<OdOptions, String> {
+    fn new(matches: ArgMatches, args: Vec<String>) -> UResult<OdOptions> {
         let byte_order = match matches.value_of(options::ENDIAN) {
             None => ByteOrder::Native,
             Some("little") => ByteOrder::Little,
             Some("big") => ByteOrder::Big,
             Some(s) => {
-                return Err(format!("Invalid argument --endian={}", s));
+                return Err(USimpleError::new(
+                    1,
+                    format!("Invalid argument --endian={}", s),
+                ));
             }
         };
 
-        let mut skip_bytes = matches.value_of(options::SKIP_BYTES).map_or(0, |s| {
-            parse_number_of_bytes(s).unwrap_or_else(|e| {
-                crash!(1, "{}", format_error_message(e, s, options::SKIP_BYTES))
-            })
-        });
+        let mut skip_bytes = match matches.value_of(options::SKIP_BYTES) {
+            None => 0,
+            Some(s) => match parse_number_of_bytes(s) {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(USimpleError::new(
+                        1,
+                        format_error_message(e, s, options::SKIP_BYTES),
+                    ))
+                }
+            },
+        };
 
         let mut label: Option<usize> = None;
 
-        let parsed_input = parse_inputs(&matches).map_err(|e| format!("Invalid inputs: {}", e))?;
+        let parsed_input = parse_inputs(&matches)
+            .map_err(|e| USimpleError::new(1, format!("Invalid inputs: {}", e)))?;
         let input_strings = match parsed_input {
             CommandLineInputs::FileNames(v) => v,
             CommandLineInputs::FileAndOffset((f, s, l)) => {
@@ -147,15 +160,26 @@ impl OdOptions {
             }
         };
 
-        let formats = parse_format_flags(&args)?;
+        let formats = parse_format_flags(&args).map_err(|e| USimpleError::new(1, e))?;
 
-        let mut line_bytes = matches.value_of(options::WIDTH).map_or(16, |s| {
-            if matches.occurrences_of(options::WIDTH) == 0 {
-                return 16;
-            };
-            parse_number_of_bytes(s)
-                .unwrap_or_else(|e| crash!(1, "{}", format_error_message(e, s, options::WIDTH)))
-        });
+        let mut line_bytes = match matches.value_of(options::WIDTH) {
+            None => 16,
+            Some(s) => {
+                if matches.occurrences_of(options::WIDTH) == 0 {
+                    16
+                } else {
+                    match parse_number_of_bytes(s) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            return Err(USimpleError::new(
+                                1,
+                                format_error_message(e, s, options::WIDTH),
+                            ))
+                        }
+                    }
+                }
+            }
+        };
 
         let min_bytes = formats.iter().fold(1, |max, next| {
             cmp::max(max, next.formatter_item_info.byte_size)
@@ -167,18 +191,28 @@ impl OdOptions {
 
         let output_duplicates = matches.is_present(options::OUTPUT_DUPLICATES);
 
-        let read_bytes = matches.value_of(options::READ_BYTES).map(|s| {
-            parse_number_of_bytes(s).unwrap_or_else(|e| {
-                crash!(1, "{}", format_error_message(e, s, options::READ_BYTES))
-            })
-        });
+        let read_bytes = match matches.value_of(options::READ_BYTES) {
+            None => None,
+            Some(s) => match parse_number_of_bytes(s) {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    return Err(USimpleError::new(
+                        1,
+                        format_error_message(e, s, options::READ_BYTES),
+                    ))
+                }
+            },
+        };
 
         let radix = match matches.value_of(options::ADDRESS_RADIX) {
             None => Radix::Octal,
             Some(s) => {
                 let st = s.as_bytes();
                 if st.len() != 1 {
-                    return Err("Radix must be one of [d, o, n, x]".to_string());
+                    return Err(USimpleError::new(
+                        1,
+                        "Radix must be one of [d, o, n, x]".to_string(),
+                    ));
                 } else {
                     let radix: char =
                         *(st.get(0).expect("byte string of length 1 lacks a 0th elem")) as char;
@@ -187,7 +221,12 @@ impl OdOptions {
                         'x' => Radix::Hexadecimal,
                         'o' => Radix::Octal,
                         'n' => Radix::NoPrefix,
-                        _ => return Err("Radix must be one of [d, o, n, x]".to_string()),
+                        _ => {
+                            return Err(USimpleError::new(
+                                1,
+                                "Radix must be one of [d, o, n, x]".to_string(),
+                            ))
+                        }
                     }
                 }
             }
@@ -209,12 +248,46 @@ impl OdOptions {
 
 /// parses and validates command line parameters, prepares data structures,
 /// opens the input and calls `odfunc` to process the input.
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let clap_opts = clap::App::new(executable!())
+    let clap_opts = uu_app();
+
+    let clap_matches = clap_opts
+        .clone() // Clone to reuse clap_opts to print help
+        .get_matches_from(args.clone());
+
+    let od_options = OdOptions::new(clap_matches, args)?;
+
+    let mut input_offset =
+        InputOffset::new(od_options.radix, od_options.skip_bytes, od_options.label);
+
+    let mut input = open_input_peek_reader(
+        &od_options.input_strings,
+        od_options.skip_bytes,
+        od_options.read_bytes,
+    );
+    let mut input_decoder = InputDecoder::new(
+        &mut input,
+        od_options.line_bytes,
+        PEEK_BUFFER_SIZE,
+        od_options.byte_order,
+    );
+
+    let output_info = OutputInfo::new(
+        od_options.line_bytes,
+        &od_options.formats[..],
+        od_options.output_duplicates,
+    );
+
+    odfunc(&mut input_offset, &mut input_decoder, &output_info)
+}
+
+pub fn uu_app() -> clap::App<'static, 'static> {
+    clap::App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
         .usage(USAGE)
@@ -397,6 +470,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .long(options::FORMAT)
                 .help("select output format or formats")
                 .multiple(true)
+                .number_of_values(1)
                 .value_name("TYPE"),
         )
         .arg(
@@ -434,41 +508,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             AppSettings::DontDelimitTrailingValues,
             AppSettings::DisableVersion,
             AppSettings::DeriveDisplayOrder,
-        ]);
-
-    let clap_matches = clap_opts
-        .clone() // Clone to reuse clap_opts to print help
-        .get_matches_from(args.clone());
-
-    let od_options = match OdOptions::new(clap_matches, args) {
-        Err(s) => {
-            crash!(1, "{}", s);
-        }
-        Ok(o) => o,
-    };
-
-    let mut input_offset =
-        InputOffset::new(od_options.radix, od_options.skip_bytes, od_options.label);
-
-    let mut input = open_input_peek_reader(
-        &od_options.input_strings,
-        od_options.skip_bytes,
-        od_options.read_bytes,
-    );
-    let mut input_decoder = InputDecoder::new(
-        &mut input,
-        od_options.line_bytes,
-        PEEK_BUFFER_SIZE,
-        od_options.byte_order,
-    );
-
-    let output_info = OutputInfo::new(
-        od_options.line_bytes,
-        &od_options.formats[..],
-        od_options.output_duplicates,
-    );
-
-    odfunc(&mut input_offset, &mut input_decoder, &output_info)
+        ])
 }
 
 /// Loops through the input line by line, calling print_bytes to take care of the output.
@@ -476,7 +516,7 @@ fn odfunc<I>(
     input_offset: &mut InputOffset,
     input_decoder: &mut InputDecoder<I>,
     output_info: &OutputInfo,
-) -> i32
+) -> UResult<()>
 where
     I: PeekRead + HasError,
 {
@@ -534,15 +574,15 @@ where
             Err(e) => {
                 show_error!("{}", e);
                 input_offset.print_final_offset();
-                return 1;
+                return Err(1.into());
             }
         };
     }
 
     if input_decoder.has_error() {
-        1
+        Err(1.into())
     } else {
-        0
+        Ok(())
     }
 }
 
@@ -630,7 +670,7 @@ fn format_error_message(error: ParseSizeError, s: &str, option: &str) -> String 
     // GNU's od echos affected flag, -N or --read-bytes (-j or --skip-bytes, etc.), depending user's selection
     // GNU's od does distinguish between "invalid (suffix in) argument"
     match error {
-        ParseSizeError::ParseFailure(_) => format!("invalid --{} argument '{}'", option, s),
-        ParseSizeError::SizeTooBig(_) => format!("--{} argument '{}' too large", option, s),
+        ParseSizeError::ParseFailure(_) => format!("invalid --{} argument {}", option, s.quote()),
+        ParseSizeError::SizeTooBig(_) => format!("--{} argument {} too large", option, s.quote()),
     }
 }

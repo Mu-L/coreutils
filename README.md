@@ -39,7 +39,7 @@ to compile anywhere, and this is as good a way as any to try and learn it.
 ### Rust Version
 
 uutils follows Rust's release channels and is tested against stable, beta and nightly.
-The current oldest supported version of the Rust compiler is `1.43.1`.
+The current oldest supported version of the Rust compiler is `1.47`.
 
 On both Windows and Redox, only the nightly version is tested currently.
 
@@ -134,6 +134,9 @@ $ cargo install --path .
 
 This command will install uutils into Cargo's *bin* folder (*e.g.* `$HOME/.cargo/bin`).
 
+This does not install files necessary for shell completion. For shell completion to work,
+use `GNU Make` or see `Manually install shell completions`.
+
 ### GNU Make
 
 To install all available utilities:
@@ -179,6 +182,10 @@ Set install parent directory (default value is /usr/local):
 $ make PREFIX=/my/path install
 ```
 
+Installing with `make` installs shell completions for all installed utilities
+for `bash`, `fish` and `zsh`. Completions for `elvish` and `powershell` can also
+be generated; See `Manually install shell completions`.
+
 ### NixOS
 
 The [standard package set](https://nixos.org/nixpkgs/manual/) of [NixOS](https://nixos.org/)
@@ -186,6 +193,23 @@ provides this package out of the box since 18.03:
 
 ```shell
 $ nix-env -iA nixos.uutils-coreutils
+```
+
+### Manually install shell completions
+
+The `coreutils` binary can generate completions for the `bash`, `elvish`, `fish`, `powershell`
+and `zsh` shells. It prints the result to stdout.
+
+The syntax is:
+```bash
+cargo run completion <utility> <shell>
+```
+
+So, to install completions for `ls` on `bash` to `/usr/local/share/bash-completion/completions/ls`,
+run:
+
+```bash
+cargo run completion ls bash > /usr/local/share/bash-completion/completions/ls
 ```
 
 ## Un-installation Instructions
@@ -341,23 +365,25 @@ To contribute to uutils, please see [CONTRIBUTING](CONTRIBUTING.md).
 
 | Done      | Semi-Done | To Do  |
 |-----------|-----------|--------|
-| arch      | cp        | chcon  |
-| base32    | date      | dd     |
-| base64    | df        | runcon |
-| basename  | expr      | stty   |
+| arch      | cp        | stty   |
+| base32    | date      |        |
+| base64    | dd        |        |
+| basename  | df        |        |
+| basenc    | expr      |        |
 | cat       | install   |        |
-| chgrp     | join      |        |
-| chmod     | ls        |        |
-| chown     | more      |        |
-| chroot    | numfmt    |        |
-| cksum     | od (`--strings` and 128-bit data types missing) | |
-| comm      | pr        |        |
-| csplit    | printf    |        |
-| cut       | sort      |        |
-| dircolors | split     |        |
-| dirname   | tac       |        |
-| du        | tail      |        |
-| echo      | test      |        |
+| chcon     | join      |        |
+| chgrp     | ls        |        |
+| chmod     | more      |        |
+| chown     | numfmt    |        |
+| chroot    | od (`--strings` and 128-bit data types missing) | |
+| cksum     | pr        |        |
+| comm      | printf    |        |
+| csplit    | sort      |        |
+| cut       | split     |        |
+| dircolors | tac       |        |
+| dirname   | tail      |        |
+| du        | test      |        |
+| echo      |           |        |
 | env       |           |        |
 | expand    |           |        |
 | factor    |           |        |
@@ -400,6 +426,7 @@ To contribute to uutils, please see [CONTRIBUTING](CONTRIBUTING.md).
 | relpath   |           |        |
 | rm        |           |        |
 | rmdir     |           |        |
+| runcon    |           |        |
 | seq       |           |        |
 | shred     |           |        |
 | shuf      |           |        |

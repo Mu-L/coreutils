@@ -170,6 +170,29 @@ fn test_rm_recursive() {
 }
 
 #[test]
+fn test_rm_recursive_multiple() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let dir = "test_rm_recursive_directory";
+    let file_a = "test_rm_recursive_directory/test_rm_recursive_file_a";
+    let file_b = "test_rm_recursive_directory/test_rm_recursive_file_b";
+
+    at.mkdir(dir);
+    at.touch(file_a);
+    at.touch(file_b);
+
+    ucmd.arg("-r")
+        .arg("-r")
+        .arg("-r")
+        .arg(dir)
+        .succeeds()
+        .no_stderr();
+
+    assert!(!at.dir_exists(dir));
+    assert!(!at.file_exists(file_a));
+    assert!(!at.file_exists(file_b));
+}
+
+#[test]
 fn test_rm_directory_without_flag() {
     let (at, mut ucmd) = at_and_ucmd!();
     let dir = "test_rm_directory_without_flag_dir";
@@ -255,10 +278,12 @@ fn test_rm_force_no_operand() {
 
 #[test]
 fn test_rm_no_operand() {
-    let mut ucmd = new_ucmd!();
-
-    ucmd.fails()
-        .stderr_is("rm: missing an argument\nrm: for help, try 'rm --help'\n");
+    let ts = TestScenario::new(util_name!());
+    ts.ucmd().fails().stderr_is(&format!(
+        "{0}: missing operand\nTry '{1} {0} --help' for more information.\n",
+        ts.util_name,
+        ts.bin_path.to_string_lossy()
+    ));
 }
 
 #[test]
@@ -288,4 +313,40 @@ fn test_rm_verbose_slash() {
 
     assert!(!at.dir_exists(dir));
     assert!(!at.file_exists(file_a));
+}
+
+#[test]
+fn test_rm_silently_accepts_presume_input_tty1() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let file_1 = "test_rm_silently_accepts_presume_input_tty1";
+
+    at.touch(file_1);
+
+    ucmd.arg("--presume-input-tty").arg(file_1).succeeds();
+
+    assert!(!at.file_exists(file_1));
+}
+
+#[test]
+fn test_rm_silently_accepts_presume_input_tty2() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let file_2 = "test_rm_silently_accepts_presume_input_tty2";
+
+    at.touch(file_2);
+
+    ucmd.arg("---presume-input-tty").arg(file_2).succeeds();
+
+    assert!(!at.file_exists(file_2));
+}
+
+#[test]
+fn test_rm_silently_accepts_presume_input_tty3() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let file_3 = "test_rm_silently_accepts_presume_input_tty3";
+
+    at.touch(file_3);
+
+    ucmd.arg("----presume-input-tty").arg(file_3).succeeds();
+
+    assert!(!at.file_exists(file_3));
 }

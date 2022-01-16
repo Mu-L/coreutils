@@ -1,6 +1,6 @@
 [package]
 name = "uu_timeout"
-version = "0.0.6"
+version = "0.0.9"
 authors = ["uutils developers"]
 license = "MIT"
 description = "timeout ~ (uutils) run COMMAND with a DURATION time limit"
@@ -15,13 +15,16 @@ edition = "2018"
 path = "src/timeout.rs"
 
 [dependencies]
-clap = "2.33"
+clap = { version = "2.33", features = ["wrap_help"] }
 libc = "0.2.42"
-nix = "0.20.0"
-uucore = { version=">=0.0.8", package="uucore", path="../../uucore", features=["process", "signals"] }
-uucore_procs = { version=">=0.0.5", package="uucore_procs", path="../../uucore_procs" }
+nix = "0.23.1"
+uucore = { version=">=0.0.11", package="uucore", path="../../uucore", features=["process", "signals"] }
+uucore_procs = { version=">=0.0.8", package="uucore_procs", path="../../uucore_procs" }
 
 
 [[bin]]
 name = "timeout"
 path = "src/main.rs"
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["uucore_procs"]

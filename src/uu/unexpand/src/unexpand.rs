@@ -16,6 +16,8 @@ use std::fs::File;
 use std::io::{stdin, stdout, BufRead, BufReader, BufWriter, Read, Stdout, Write};
 use std::str::from_utf8;
 use unicode_width::UnicodeWidthChar;
+use uucore::display::Quotable;
+use uucore::error::{FromIo, UResult};
 use uucore::InvalidEncodingHandling;
 
 static NAME: &str = "unexpand";
@@ -89,12 +91,19 @@ impl Options {
     }
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().get_matches_from(args);
+
+    unexpand(Options::new(matches)).map_err_context(String::new)
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .name(NAME)
         .version(crate_version!())
         .usage(USAGE)
@@ -126,11 +135,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .long(options::NO_UTF8)
                 .takes_value(false)
                 .help("interpret input file as 8-bit ASCII rather than UTF-8"))
-        .get_matches_from(args);
-
-    unexpand(Options::new(matches));
-
-    0
 }
 
 fn open(path: String) -> BufReader<Box<dyn Read + 'static>> {
@@ -138,9 +142,9 @@ fn open(path: String) -> BufReader<Box<dyn Read + 'static>> {
     if path == "-" {
         BufReader::new(Box::new(stdin()) as Box<dyn Read>)
     } else {
-        file_buf = match File::open(&path[..]) {
+        file_buf = match File::open(&path) {
             Ok(a) => a,
-            Err(e) => crash!(1, "{}: {}", &path[..], e),
+            Err(e) => crash!(1, "{}: {}", path.maybe_quote(), e),
         };
         BufReader::new(Box::new(file_buf) as Box<dyn Read>)
     }
@@ -175,13 +179,13 @@ fn write_tabs(
                 break;
             }
 
-            safe_unwrap!(output.write_all(b"\t"));
+            crash_if_err!(1, output.write_all(b"\t"));
             scol += nts;
         }
     }
 
     while col > scol {
-        safe_unwrap!(output.write_all(b" "));
+        crash_if_err!(1, output.write_all(b" "));
         scol += 1;
     }
 }
@@ -238,7 +242,7 @@ fn next_char_info(uflag: bool, buf: &[u8], byte: usize) -> (CharType, usize, usi
     (ctype, cwidth, nbytes)
 }
 
-fn unexpand(options: Options) {
+fn unexpand(options: Options) -> std::io::Result<()> {
     let mut output = BufWriter::new(stdout());
     let ts = &options.tabstops[..];
     let mut buf = Vec::new();
@@ -269,7 +273,7 @@ fn unexpand(options: Options) {
                         init,
                         true,
                     );
-                    safe_unwrap!(output.write_all(&buf[byte..]));
+                    output.write_all(&buf[byte..])?;
                     scol = col;
                     break;
                 }
@@ -289,7 +293,7 @@ fn unexpand(options: Options) {
                         };
 
                         if !tabs_buffered {
-                            safe_unwrap!(output.write_all(&buf[byte..byte + nbytes]));
+                            output.write_all(&buf[byte..byte + nbytes])?;
                             scol = col; // now printed up to this column
                         }
                     }
@@ -314,7 +318,7 @@ fn unexpand(options: Options) {
                         } else {
                             0
                         };
-                        safe_unwrap!(output.write_all(&buf[byte..byte + nbytes]));
+                        output.write_all(&buf[byte..byte + nbytes])?;
                         scol = col; // we've now printed up to this column
                     }
                 }
@@ -333,9 +337,9 @@ fn unexpand(options: Options) {
                 init,
                 true,
             );
-            safe_unwrap!(output.flush());
+            output.flush()?;
             buf.truncate(0); // clear out the buffer
         }
     }
-    crash_if_err!(1, output.flush())
+    output.flush()
 }

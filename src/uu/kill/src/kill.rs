@@ -13,13 +13,12 @@ extern crate uucore;
 use clap::{crate_version, App, Arg};
 use libc::{c_int, pid_t};
 use std::io::Error;
-use uucore::signals::ALL_SIGNALS;
+use uucore::display::Quotable;
+use uucore::error::{UResult, USimpleError};
+use uucore::signals::{signal_by_name_or_value, ALL_SIGNALS};
 use uucore::InvalidEncodingHandling;
 
 static ABOUT: &str = "Send signal to processes or list information about signals.";
-
-static EXIT_OK: i32 = 0;
-static EXIT_ERR: i32 = 1;
 
 pub mod options {
     pub static PIDS_OR_SIGNALS: &str = "pids_of_signals";
@@ -36,17 +35,53 @@ pub enum Mode {
     List,
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let mut args = args
         .collect_str(InvalidEncodingHandling::Ignore)
         .accept_any();
-    let (args, obs_signal) = handle_obsolete(args);
+    let obs_signal = handle_obsolete(&mut args);
 
-    let usage = format!("{} [OPTIONS]... PID...", executable!());
-    let matches = App::new(executable!())
+    let usage = format!("{} [OPTIONS]... PID...", uucore::execution_phrase());
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+
+    let mode = if matches.is_present(options::TABLE) || matches.is_present(options::TABLE_OLD) {
+        Mode::Table
+    } else if matches.is_present(options::LIST) {
+        Mode::List
+    } else {
+        Mode::Kill
+    };
+
+    let pids_or_signals: Vec<String> = matches
+        .values_of(options::PIDS_OR_SIGNALS)
+        .map(|v| v.map(ToString::to_string).collect())
+        .unwrap_or_default();
+
+    match mode {
+        Mode::Kill => {
+            let sig = if let Some(signal) = obs_signal {
+                signal
+            } else if let Some(signal) = matches.value_of(options::SIGNAL) {
+                parse_signal_value(signal)?
+            } else {
+                15_usize //SIGTERM
+            };
+            let pids = parse_pids(&pids_or_signals)?;
+            kill(sig, &pids)
+        }
+        Mode::Table => {
+            table();
+            Ok(())
+        }
+        Mode::List => list(pids_or_signals.get(0).cloned()),
+    }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
         .arg(
             Arg::with_name(options::LIST)
                 .short("l")
@@ -74,58 +109,24 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .hidden(true)
                 .multiple(true),
         )
-        .get_matches_from(args);
-
-    let mode = if matches.is_present(options::TABLE) || matches.is_present(options::TABLE_OLD) {
-        Mode::Table
-    } else if matches.is_present(options::LIST) {
-        Mode::List
-    } else {
-        Mode::Kill
-    };
-
-    let pids_or_signals: Vec<String> = matches
-        .values_of(options::PIDS_OR_SIGNALS)
-        .map(|v| v.map(ToString::to_string).collect())
-        .unwrap_or_default();
-
-    match mode {
-        Mode::Kill => {
-            let sig = match (obs_signal, matches.value_of(options::SIGNAL)) {
-                (Some(s), Some(_)) => s, // -s takes precedence
-                (Some(s), None) => s,
-                (None, Some(s)) => s.to_owned(),
-                (None, None) => "TERM".to_owned(),
-            };
-            return kill(&sig, &pids_or_signals);
-        }
-        Mode::Table => table(),
-        Mode::List => list(pids_or_signals.get(0).cloned()),
-    }
-
-    EXIT_OK
 }
 
-fn handle_obsolete(mut args: Vec<String>) -> (Vec<String>, Option<String>) {
-    let mut i = 0;
-    while i < args.len() {
-        // this is safe because slice is valid when it is referenced
-        let slice = &args[i].clone();
-        if slice.starts_with('-') && slice.chars().nth(1).map_or(false, |c| c.is_digit(10)) {
-            let val = &slice[1..];
-            match val.parse() {
-                Ok(num) => {
-                    if uucore::signals::is_signal(num) {
-                        args.remove(i);
-                        return (args, Some(val.to_owned()));
-                    }
-                }
-                Err(_) => break, /* getopts will error out for us */
+fn handle_obsolete(args: &mut Vec<String>) -> Option<usize> {
+    // Sanity check
+    if args.len() > 2 {
+        // Old signal can only be in the first argument position
+        let slice = args[1].as_str();
+        if let Some(signal) = slice.strip_prefix('-') {
+            // Check if it is a valid signal
+            let opt_signal = signal_by_name_or_value(signal);
+            if opt_signal.is_some() {
+                // remove the signal before return
+                args.remove(1);
+                return opt_signal;
             }
         }
-        i += 1;
     }
-    (args, None)
+    None
 }
 
 fn table() {
@@ -137,61 +138,71 @@ fn table() {
             println!();
         }
     }
-    println!()
+    println!();
 }
 
-fn print_signal(signal_name_or_value: &str) {
+fn print_signal(signal_name_or_value: &str) -> UResult<()> {
     for (value, &signal) in ALL_SIGNALS.iter().enumerate() {
         if signal == signal_name_or_value || (format!("SIG{}", signal)) == signal_name_or_value {
             println!("{}", value);
-            exit!(EXIT_OK as i32)
+            return Ok(());
         } else if signal_name_or_value == value.to_string() {
             println!("{}", signal);
-            exit!(EXIT_OK as i32)
+            return Ok(());
         }
     }
-    crash!(EXIT_ERR, "unknown signal name {}", signal_name_or_value)
+    Err(USimpleError::new(
+        1,
+        format!("unknown signal name {}", signal_name_or_value.quote()),
+    ))
 }
 
 fn print_signals() {
-    let mut pos = 0;
     for (idx, signal) in ALL_SIGNALS.iter().enumerate() {
-        pos += signal.len();
-        print!("{}", signal);
-        if idx > 0 && pos > 73 {
-            println!();
-            pos = 0;
-        } else {
-            pos += 1;
+        if idx > 0 {
             print!(" ");
+        }
+        print!("{}", signal);
+    }
+    println!();
+}
+
+fn list(arg: Option<String>) -> UResult<()> {
+    match arg {
+        Some(ref x) => print_signal(x),
+        None => {
+            print_signals();
+            Ok(())
         }
     }
 }
 
-fn list(arg: Option<String>) {
-    match arg {
-        Some(ref x) => print_signal(x),
-        None => print_signals(),
-    };
+fn parse_signal_value(signal_name: &str) -> UResult<usize> {
+    let optional_signal_value = signal_by_name_or_value(signal_name);
+    match optional_signal_value {
+        Some(x) => Ok(x),
+        None => Err(USimpleError::new(
+            1,
+            format!("unknown signal name {}", signal_name.quote()),
+        )),
+    }
 }
 
-fn kill(signalname: &str, pids: &[String]) -> i32 {
-    let mut status = 0;
-    let optional_signal_value = uucore::signals::signal_by_name_or_value(signalname);
-    let signal_value = match optional_signal_value {
-        Some(x) => x,
-        None => crash!(EXIT_ERR, "unknown signal name {}", signalname),
-    };
-    for pid in pids {
-        match pid.parse::<usize>() {
-            Ok(x) => {
-                if unsafe { libc::kill(x as pid_t, signal_value as c_int) } != 0 {
-                    show_error!("{}", Error::last_os_error());
-                    status = 1;
-                }
-            }
-            Err(e) => crash!(EXIT_ERR, "failed to parse argument {}: {}", pid, e),
-        };
+fn parse_pids(pids: &[String]) -> UResult<Vec<usize>> {
+    pids.iter()
+        .map(|x| {
+            x.parse::<usize>().map_err(|e| {
+                USimpleError::new(1, format!("failed to parse argument {}: {}", x.quote(), e))
+            })
+        })
+        .collect()
+}
+
+fn kill(signal_value: usize, pids: &[usize]) -> UResult<()> {
+    for &pid in pids {
+        if unsafe { libc::kill(pid as pid_t, signal_value as c_int) } != 0 {
+            show!(USimpleError::new(1, format!("{}", Error::last_os_error())));
+        }
     }
-    status
+    Ok(())
 }

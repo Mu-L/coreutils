@@ -9,12 +9,10 @@
 
 // spell-checker:ignore (ToDO) ttyname filedesc
 
-#[macro_use]
-extern crate uucore;
-
 use clap::{crate_version, App, Arg};
 use std::ffi::CStr;
 use std::io::Write;
+use uucore::error::{UResult, UUsageError};
 use uucore::InvalidEncodingHandling;
 
 static ABOUT: &str = "Print the file name of the terminal connected to standard input.";
@@ -23,37 +21,21 @@ mod options {
     pub const SILENT: &str = "silent";
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]...", uucore::execution_phrase())
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let usage = usage();
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
+    let matches = uu_app()
         .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::SILENT)
-                .long(options::SILENT)
-                .visible_alias("quiet")
-                .short("s")
-                .help("print nothing, only return an exit status")
-                .required(false),
-        )
-        .get_matches_from_safe(args);
-
-    let matches = match matches {
-        Ok(m) => m,
-        Err(e) => {
-            eprint!("{}", e);
-            return 2;
-        }
-    };
+        .get_matches_from_safe(args)
+        .map_err(|e| UUsageError::new(2, format!("{}", e)))?;
 
     let silent = matches.is_present(options::SILENT);
 
@@ -83,8 +65,22 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     }
 
     if atty::is(atty::Stream::Stdin) {
-        libc::EXIT_SUCCESS
+        Ok(())
     } else {
-        libc::EXIT_FAILURE
+        Err(libc::EXIT_FAILURE.into())
     }
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .arg(
+            Arg::with_name(options::SILENT)
+                .long(options::SILENT)
+                .visible_alias("quiet")
+                .short("s")
+                .help("print nothing, only return an exit status")
+                .required(false),
+        )
 }

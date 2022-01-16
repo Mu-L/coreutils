@@ -9,13 +9,10 @@
 
 extern crate libc;
 
-#[macro_use]
-extern crate uucore;
-
 use clap::{crate_version, App, Arg};
 use std::path::Path;
-
-static EXIT_ERR: i32 = 1;
+use uucore::display::Quotable;
+use uucore::error::{UResult, USimpleError};
 
 static ABOUT: &str = "Synchronize cached writes to persistent storage";
 pub mod options {
@@ -71,6 +68,7 @@ mod platform {
     use std::mem;
     use std::os::windows::prelude::*;
     use std::path::Path;
+    use uucore::crash;
     use uucore::wide::{FromWide, ToWide};
 
     unsafe fn flush_volume(name: &str) {
@@ -159,17 +157,47 @@ mod platform {
     }
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... FILE...", executable!())
+fn usage() -> String {
+    format!("{0} [OPTION]... FILE...", uucore::execution_phrase())
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let usage = usage();
 
-    let matches = App::new(executable!())
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
+
+    let files: Vec<String> = matches
+        .values_of(ARG_FILES)
+        .map(|v| v.map(ToString::to_string).collect())
+        .unwrap_or_default();
+
+    for f in &files {
+        if !Path::new(&f).exists() {
+            return Err(USimpleError::new(
+                1,
+                format!("cannot stat {}: No such file or directory", f.quote()),
+            ));
+        }
+    }
+
+    #[allow(clippy::if_same_then_else)]
+    if matches.is_present(options::FILE_SYSTEM) {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        syncfs(files);
+    } else if matches.is_present(options::DATA) {
+        #[cfg(target_os = "linux")]
+        fdatasync(files);
+    } else {
+        sync();
+    }
+    Ok(())
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
         .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
         .arg(
             Arg::with_name(options::FILE_SYSTEM)
                 .short("f")
@@ -185,30 +213,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .help("sync only file data, no unneeded metadata (Linux only)"),
         )
         .arg(Arg::with_name(ARG_FILES).multiple(true).takes_value(true))
-        .get_matches_from(args);
-
-    let files: Vec<String> = matches
-        .values_of(ARG_FILES)
-        .map(|v| v.map(ToString::to_string).collect())
-        .unwrap_or_default();
-
-    for f in &files {
-        if !Path::new(&f).exists() {
-            crash!(EXIT_ERR, "cannot stat '{}': No such file or directory", f);
-        }
-    }
-
-    #[allow(clippy::if_same_then_else)]
-    if matches.is_present(options::FILE_SYSTEM) {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        syncfs(files);
-    } else if matches.is_present(options::DATA) {
-        #[cfg(target_os = "linux")]
-        fdatasync(files);
-    } else {
-        sync();
-    }
-    0
 }
 
 fn sync() -> isize {

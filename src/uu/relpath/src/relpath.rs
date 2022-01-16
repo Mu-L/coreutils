@@ -7,13 +7,12 @@
 
 // spell-checker:ignore (ToDO) subpath absto absfrom absbase
 
-#[macro_use]
-extern crate uucore;
-
 use clap::{crate_version, App, Arg};
 use std::env;
 use std::path::{Path, PathBuf};
-use uucore::fs::{canonicalize, CanonicalizeMode};
+use uucore::display::println_verbatim;
+use uucore::error::{FromIo, UResult};
+use uucore::fs::{canonicalize, MissingHandling, ResolveMode};
 use uucore::InvalidEncodingHandling;
 
 static ABOUT: &str = "Convert TO destination to the relative path from the FROM dir.
@@ -25,53 +24,37 @@ mod options {
     pub const FROM: &str = "FROM";
 }
 
-fn get_usage() -> String {
-    format!("{} [-d DIR] TO [FROM]", executable!())
+fn usage() -> String {
+    format!("{} [-d DIR] TO [FROM]", uucore::execution_phrase())
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
+#[uucore_procs::gen_uumain]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = args
         .collect_str(InvalidEncodingHandling::ConvertLossy)
         .accept_any();
-    let usage = get_usage();
+    let usage = usage();
 
-    let matches = App::new(executable!())
-        .version(crate_version!())
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::DIR)
-                .short("d")
-                .takes_value(true)
-                .help("If any of FROM and TO is not subpath of DIR, output absolute path instead of relative"),
-        )
-        .arg(
-            Arg::with_name(options::TO)
-                .required(true)
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name(options::FROM)
-                .takes_value(true),
-        )
-        .get_matches_from(args);
+    let matches = uu_app().usage(&usage[..]).get_matches_from(args);
 
     let to = Path::new(matches.value_of(options::TO).unwrap()).to_path_buf(); // required
     let from = match matches.value_of(options::FROM) {
         Some(p) => Path::new(p).to_path_buf(),
         None => env::current_dir().unwrap(),
     };
-    let absto = canonicalize(to, CanonicalizeMode::Normal).unwrap();
-    let absfrom = canonicalize(from, CanonicalizeMode::Normal).unwrap();
+    let absto = canonicalize(to, MissingHandling::Normal, ResolveMode::Logical)
+        .map_err_context(String::new)?;
+    let absfrom = canonicalize(from, MissingHandling::Normal, ResolveMode::Logical)
+        .map_err_context(String::new)?;
 
     if matches.is_present(options::DIR) {
         let base = Path::new(&matches.value_of(options::DIR).unwrap()).to_path_buf();
-        let absbase = canonicalize(base, CanonicalizeMode::Normal).unwrap();
+        let absbase = canonicalize(base, MissingHandling::Normal, ResolveMode::Logical)
+            .map_err_context(String::new)?;
         if !absto.as_path().starts_with(absbase.as_path())
             || !absfrom.as_path().starts_with(absbase.as_path())
         {
-            println!("{}", absto.display());
-            return 0;
+            return println_verbatim(absto).map_err_context(String::new);
         }
     }
 
@@ -96,6 +79,26 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         .map(|x| result.push(x.as_os_str()))
         .last();
 
-    println!("{}", result.display());
-    0
+    println_verbatim(result).map_err_context(String::new)
+}
+
+pub fn uu_app() -> App<'static, 'static> {
+    App::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .arg(
+            Arg::with_name(options::DIR)
+                .short("d")
+                .takes_value(true)
+                .help("If any of FROM and TO is not subpath of DIR, output absolute path instead of relative"),
+        )
+        .arg(
+            Arg::with_name(options::TO)
+                .required(true)
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name(options::FROM)
+                .takes_value(true),
+        )
 }

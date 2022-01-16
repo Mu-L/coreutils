@@ -1,6 +1,6 @@
 [package]
 name = "uu_tr"
-version = "0.0.6"
+version = "0.0.9"
 authors = ["uutils developers"]
 license = "MIT"
 description = "tr ~ (uutils) translate characters within input and display"
@@ -17,10 +17,13 @@ path = "src/tr.rs"
 [dependencies]
 bit-set = "0.5.0"
 fnv = "1.0.5"
-clap = "2.33"
-uucore = { version=">=0.0.8", package="uucore", path="../../uucore" }
-uucore_procs = { version=">=0.0.5", package="uucore_procs", path="../../uucore_procs" }
+clap = { version = "2.33", features = ["wrap_help"] }
+uucore = { version=">=0.0.11", package="uucore", path="../../uucore" }
+uucore_procs = { version=">=0.0.8", package="uucore_procs", path="../../uucore_procs" }
 
 [[bin]]
 name = "tr"
 path = "src/main.rs"
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["uucore_procs"]
